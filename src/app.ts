@@ -284,6 +284,12 @@ export function bootstrapApp(
   /** Live model selection — overrides the request route via the waterfall. */
   let selection: SessionRoute | null = null
   /**
+   * Route last announced to the model through an injected notice. Reset with
+   * every agent, so a resumed session re-announces its (possibly different)
+   * route once.
+   */
+  let announcedSelection: SessionRoute | null = null
+  /**
    * Live preset selection (preset id) — composed via `meta.agentPreset` +
    * factory `setup` mount on the NEXT fresh session (`/new`). Resume/fork
    * inherit the recorded lineage; the running session never changes.
@@ -980,6 +986,7 @@ export function bootstrapApp(
     agent = null
     // The discovered command list belongs to the agent scope that is leaving.
     kernelCommands = []
+    announcedSelection = null
     while (approvalQueue.length > 0) settleApprovalHead('cancelled')
     for (const stop of agentListenerDisposers.splice(0)) stop()
     try {
@@ -1219,6 +1226,16 @@ export function bootstrapApp(
     } catch {
       // Keep last known policy.
     }
+    // Model selection, in the spirit of the kernel's `installModelSelection`
+    // (@deepseek-ai/dsh-agent/model-selection): the live selection overrides
+    // the resolved call config at request time, an ABSENT effort clears any
+    // inherited effort, and a provider/model change is announced to the model
+    // through a durable injected notice so it is not silently swapped under
+    // it. The kernel's helper itself is a runtime export of a kernel package
+    // and is deliberately NOT imported: an out-of-tree plugin resolves
+    // `@deepseek-ai/*` through the profile's module fallback, which on this
+    // machine still holds a stale 0.1.2-alpha.3 copy — importing it would
+    // install a foreign generation's waterfall over a 0.1.5 kernel.
     const disposeWaterfall = next.ctx.on('agent/request', (...args: unknown[]) => {
       const waterfallNext = args[1] as () => Promise<Record<string, unknown>>
       return (async (): Promise<Record<string, unknown>> => {
@@ -1394,12 +1411,46 @@ export function bootstrapApp(
     return true
   }
 
+  /**
+   * Announce a provider/model change to the MODEL, durably — the kernel's
+   * `installModelSelection` appends exactly such an injected user-role notice
+   * ("the model learns the policy/switch from the log"), and without it a
+   * silent 换模型 leaves the model reasoning about a route it is no longer
+   * on. Effort-only changes add nothing (matching the kernel's rule), and a
+   * repeat of the same route is never announced twice.
+   */
+  const announceSelection = (next: SessionRoute): void => {
+    if (!agent) return
+    const previous = announcedSelection
+    if (previous !== null && previous.provider === next.provider && previous.model === next.model) return
+    const effort = next.reasoningEffort !== undefined && next.reasoningEffort !== '' ? ` (reasoning effort: ${next.reasoningEffort})` : ''
+    try {
+      agent.inject({
+        id: `msg-${randomUUID()}`,
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: `[orca] The active model for this session is now ${next.provider}/${next.model}${effort}. Apply it from the next request onward.`,
+          },
+        ],
+        // `plugin` (never `user`): the notice is model-facing context, not a
+        // human prompt — the transcript projection drops it.
+        source: { kind: 'plugin', plugin: 'orca' },
+      })
+      announcedSelection = { ...next }
+    } catch {
+      // Best-effort: a failed notice must never break the switch.
+    }
+  }
+
   const applySelection = (next: SessionRoute): void => {
     dbg(`applySelection ${next.provider}/${next.model}`)
     selection = next
     effortCleared = next.reasoningEffort === undefined
     const effort = next.reasoningEffort ? `(${next.reasoningEffort})` : ''
     channel.pushSystem(`模型已切换：${next.provider}/${next.model}${effort} · 下一次请求生效`)
+    announceSelection(next)
     const defaultModel = getDefaultModel()
     if (defaultModel) {
       // Persist as the composition default, best-effort — the settings write

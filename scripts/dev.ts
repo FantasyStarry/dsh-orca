@@ -202,6 +202,8 @@ interface KernelRecord {
   followupMessage: UserMessage | null
   cancelCause: { kind: string } | null
   selectionSaved: { provider: string; model: string; reasoningEffort?: string } | null
+  /** Messages the plugin queued through `agent.inject` (model-facing context). */
+  injected: UserMessage[]
   requestListener: ((...args: unknown[]) => unknown) | null
   approvalListener: ((...args: unknown[]) => unknown) | null
   streamListener: ((...args: unknown[]) => unknown) | null
@@ -226,6 +228,7 @@ class FakeKernel implements KernelContext {
     followupMessage: null,
     cancelCause: null,
     selectionSaved: null,
+    injected: [],
     requestListener: null,
     approvalListener: null,
     streamListener: null,
@@ -532,7 +535,9 @@ class FakeKernel implements KernelContext {
           kernel.streamTurn(message)
         },
         steer(_message: UserMessage): void {},
-        inject(_message: UserMessage): void {},
+        inject(message: UserMessage): void {
+          kernel.record.injected.push(message)
+        },
         cancel(cause: { kind: string }): void {
           kernel.record.cancelCause = cause
         },
@@ -1026,6 +1031,20 @@ async function main(): Promise<void> {
   }
   if (record.selectionSaved?.provider !== 'fake-a' || record.selectionSaved.model !== 'fake-a-m1' || record.selectionSaved.reasoningEffort !== 'low') {
     problems.push('phase2：saveSelection 未持久化选择')
+  }
+  // The model must LEARN about the switch (durable injected notice, the
+  // behavior the kernel's installModelSelection provides) — and only once,
+  // sourced `plugin` so the transcript never shows it as a human prompt.
+  {
+    const injected = record.injected
+    if (injected.length !== 1) problems.push(`phase2：模型切换未注入一次告知：${injected.length}`)
+    const notice = injected[0]
+    const text = notice?.content[0]
+    if (notice?.source['kind'] !== 'plugin') problems.push('phase2：切换告知的 source 应为 plugin')
+    if (text?.type !== 'text' || !text.text.includes('fake-a/fake-a-m1') || !text.text.includes('low')) {
+      problems.push(`phase2：切换告知内容异常：${JSON.stringify(text ?? null)}`)
+    }
+    if (visible2.includes('[orca] The active model')) problems.push('phase2：切换告知不应进入转录')
   }
   const listener = record.requestListener
   if (!listener) {
