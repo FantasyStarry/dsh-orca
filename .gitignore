@@ -8,3 +8,4 @@ probe-last-raw.log
 live-dump.txt
 e2e-last-buffer.log
 probe-attach-sample.txt
+.probe-crops/

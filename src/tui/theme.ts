@@ -107,7 +107,10 @@ const truecolorPalette: PaletteSpec = {
   border: rgb(111, 111, 111), // #6F6F6F
   code: rgb(79, 168, 255), // #4FA8FF
   quote: rgb(156, 156, 156), // #9C9C9C
-  placeholder: pair('\x1b[2;3m\x1b[38;2;128;128;128m', '\x1b[39m\x1b[23m\x1b[22m'), // dim italic
+  // Bright-enough neutral grey, NO dim/italic: cmd.exe maps SGR 2 (dim) onto
+  // its own palette and renders the placeholder as a barely-readable dark red
+  // on black, so the placeholder must be carried by color alone.
+  placeholder: rgb(156, 156, 156), // #9C9C9C
   roleUser: pair('\x1b[1m\x1b[38;2;255;203;107m', '\x1b[39m\x1b[22m'), // #FFCB6B bold
   cursor: pair('\x1b[7m', '\x1b[27m'), // reverse video
   panel: bg(38, 42, 48), // #262A30
@@ -131,7 +134,7 @@ const palette256: PaletteSpec = {
   border: c256(241),
   code: c256(75),
   quote: c256(244),
-  placeholder: pair('\x1b[2;3;38;5;242m', '\x1b[39m\x1b[23m\x1b[22m'),
+  placeholder: c256(245), // neutral grey — see the truecolor note (no dim/italic)
   roleUser: pair('\x1b[1;38;5;221m', '\x1b[39m\x1b[22m'),
   cursor: pair('\x1b[7m', '\x1b[27m'), // reverse video
   panel: bg256(236),

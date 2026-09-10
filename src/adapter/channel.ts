@@ -18,6 +18,7 @@
  */
 
 import type { SessionEvent, StreamChunk, TodoItem } from '../kernel/types.js'
+import { formatTokenCount, shortModelName } from '../tui/format.js'
 
 export type RowKind = 'user' | 'assistant' | 'thought' | 'tool' | 'system'
 
@@ -342,6 +343,8 @@ export class Channel {
   private readonly pendingTools = new Map<string, TranscriptRow>()
   /** Audit pairing: `approval/asked` id → the tool it is about. */
   private readonly approvalTools = new Map<string, string>()
+  /** Route printed by the previous turn summary — repeats are omitted. */
+  private lastSummaryRoute: string | null = null
   /**
    * True once a live model-stream delta reached this step. The durable
    * `assistant/message` then only RECONCILES the streamed text; without any
@@ -477,19 +480,28 @@ export class Channel {
         // Settle the token window into one transcript row (OpenCode-style turn
         // summary). Token-free turns (cancelled before the first step) report
         // nothing and leave no row behind.
+        //
+        // Deliberately terse: the footer already carries the live route and the
+        // SESSION-CUMULATIVE ↑↓, so this row keeps only what is per-turn (the
+        // window's ↑↓/cache, the duration, the throughput). The model appears
+        // ONLY when it differs from the previous turn's — a mid-session switch
+        // stays recorded without repeating one string on every turn.
         if (this.turnStartMs !== null && this.turnOutputTokens > 0) {
           const ms = Math.max(0, eventMs(event) - this.turnStartMs)
           const seconds = Math.max(0.1, Math.round(ms / 100) / 10)
           const tokPerSec = Math.round((this.turnOutputTokens / seconds) * 10) / 10
           const route = this.route ? `${this.route.provider}/${this.route.model}` : ''
+          const showRoute = route !== '' && route !== this.lastSummaryRoute
+          if (route !== '') this.lastSummaryRoute = route
+          const model = this.route ? shortModelName(this.route.model, this.route.provider) : ''
           const tokens =
-            `↑${this.turnInputTokens} ↓${this.turnOutputTokens}` +
-            (this.turnReasoningTokens > 0 ? ` ✻${this.turnReasoningTokens}` : '')
+            `↑${formatTokenCount(this.turnInputTokens)} ↓${formatTokenCount(this.turnOutputTokens)}` +
+            (this.turnReasoningTokens > 0 ? ` ✻${formatTokenCount(this.turnReasoningTokens)}` : '')
           const cache = this.turnCacheRead + this.turnCacheWrite
           this.pushSystem(
-            `✓ 本轮${route ? ` · ${route}` : ''} · ${tokens}` +
-              (cache > 0 ? ` · ⇄${cache} 缓存` : '') +
-              ` · 用时${fmtDuration(seconds)} · ${tokPerSec.toFixed(1)} tok/s`,
+            `✓ 本轮${showRoute && model !== '' ? ` · ${model}` : ''}` +
+              ` · ${fmtDuration(seconds)} · ${tokPerSec.toFixed(1)} tok/s · ${tokens}` +
+              (cache > 0 ? ` · ⇄${formatTokenCount(cache)} 缓存` : ''),
           )
         }
         this.turnStartMs = null
@@ -848,6 +860,7 @@ export class Channel {
     this.compacting = false
     this.lastSeq = null
     this.turnSeqs = []
+    this.lastSummaryRoute = null
     this.version++
   }
 

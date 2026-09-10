@@ -33,6 +33,7 @@ import { boxed, boxLine, boxTop, boxBottom, type BoxStyle } from './box.js'
 import { theme } from './theme.js'
 import { stringWidth, truncateWidth, wrapWidth } from './width.js'
 import { cleanLine, cleanText } from './sanitize.js'
+import { formatTokenCount } from './format.js'
 
 export interface FrameContext {
   readonly channel: Channel
@@ -848,9 +849,7 @@ function gutterLine(content: string, width: number): string {
 }
 
 function fmtTokens(count: number): string {
-  if (count >= 100000) return `${Math.round(count / 1000)}k`
-  if (count >= 1000) return `${(count / 1000).toFixed(1)}k`
-  return String(count)
+  return formatTokenCount(count)
 }
 
 function short(cwd: string): string {

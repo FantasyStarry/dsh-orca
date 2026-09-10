@@ -26,6 +26,7 @@ import { Config } from '../src/index.js'
 import type { OrcaConfig } from '../src/index.js'
 import { Renderer } from '../src/tui/renderer.js'
 import { buildFrame } from '../src/tui/chat.js'
+import { boxBottom, boxLine, boxTop } from '../src/tui/box.js'
 import type {
   AgentHandle,
   CreateAgentOptions,
@@ -808,7 +809,8 @@ async function main(): Promise<void> {
 
   // ── Phase 0.85: turn settlement lands one summary row on exact durable
   // timestamps (45 output tokens over 0.6s ⇒ 75.0 tok/s); token-free turns
-  // settle nothing ─────────────────────────────────────────────────────────
+  // settle nothing. The row must stay TERSE: no provider prefix, and the model
+  // only when it differs from the previous turn's ─────────────────────────────
   {
     const ch = new Channel()
     const t0 = Date.now()
@@ -817,16 +819,53 @@ async function main(): Promise<void> {
     ch.ingest({ type: 'assistant/message', seq: 2, time: t0 + 600, data: { usage: { inputTokens: 120, outputTokens: 45, reasoningTokens: 30, cacheReadTokens: 60, cacheWriteTokens: 15 } } } as never)
     ch.ingest({ type: 'turn/end', seq: 3, time: t0 + 600, data: { turn: 1, reason: { kind: 'completed' } } } as never)
     const transcript = ch.rows.map((row) => row.text).join('\n')
-    for (const expect of ['✓ 本轮', 'p/m', '↑120 ↓45', '✻30', '⇄75 缓存', '用时0.6s', '75.0 tok/s']) {
-      if (!transcript.includes(expect)) problems.push(`phase0.85：回合结算行缺「${expect}」`)
+    for (const expect of ['✓ 本轮', ' · m · ', '0.6s', '75.0 tok/s', '↑120 ↓45', '✻30', '⇄75 缓存']) {
+      if (!transcript.includes(expect)) problems.push(`phase0.85：回合结算行缺「${expect}」：${transcript}`)
     }
+    if (transcript.includes('p/m')) problems.push(`phase0.85：结算行不应重复 provider 前缀：${transcript}`)
+    if (transcript.includes('用时')) problems.push(`phase0.85：结算行不应带「用时」标签：${transcript}`)
     if (ch.usage.cacheRead !== 60 || ch.usage.cacheWrite !== 15) {
       problems.push(`phase0.85：缓存 token 未累加：${JSON.stringify(ch.usage)}`)
     }
+    // Second turn on the SAME route: the model name is not repeated.
+    ch.ingest({ type: 'assistant/message', seq: 4, time: t0 + 700, data: { usage: { inputTokens: 10, outputTokens: 5 } } } as never)
+    ch.ingest({ type: 'assistant/message', seq: 5, time: t0 + 800, data: { usage: { inputTokens: 10, outputTokens: 5 } } } as never)
+    ch.ingest({ type: 'turn/start', seq: 6, time: t0 + 700, data: { turn: 2 } } as never)
+    ch.ingest({ type: 'assistant/message', seq: 7, time: t0 + 1000, data: { usage: { inputTokens: 10, outputTokens: 5 } } } as never)
+    ch.ingest({ type: 'turn/end', seq: 8, time: t0 + 1300, data: { turn: 2, reason: { kind: 'completed' } } } as never)
+    const summaries = ch.rows.filter((row) => row.text.startsWith('✓ 本轮'))
+    if (summaries.length !== 2) problems.push(`phase0.85：回合结算行数量异常：${String(summaries.length)}`)
+    if (summaries[1]?.text.includes(' · m · ')) {
+      problems.push(`phase0.85：同路由的第二轮不应重复模型名：${summaries[1]?.text ?? ''}`)
+    }
+    // A real switch IS announced again.
+    ch.ingest({ type: 'request/header', seq: 9, time: t0 + 1400, data: { header: { config: { provider: 'q', model: 'm2' } } } } as never)
+    ch.ingest({ type: 'turn/start', seq: 10, time: t0 + 1400, data: { turn: 3 } } as never)
+    ch.ingest({ type: 'assistant/message', seq: 11, time: t0 + 1700, data: { usage: { inputTokens: 10, outputTokens: 5 } } } as never)
+    ch.ingest({ type: 'turn/end', seq: 12, time: t0 + 2000, data: { turn: 3, reason: { kind: 'completed' } } } as never)
+    const third = ch.rows.filter((row) => row.text.startsWith('✓ 本轮'))[2]
+    if (third === undefined || !third.text.includes(' · m2 · ')) {
+      problems.push(`phase0.85：切模型后的结算行应重新带上模型名：${third?.text ?? '(缺)'}`)
+    }
     const before = ch.rows.length
-    ch.ingest({ type: 'turn/start', seq: 4, time: t0 + 700, data: { turn: 2 } } as never)
-    ch.ingest({ type: 'turn/end', seq: 5, time: t0 + 800, data: { turn: 2, reason: { kind: 'cancelled' } } } as never)
+    ch.ingest({ type: 'turn/start', seq: 13, time: t0 + 2100, data: { turn: 4 } } as never)
+    ch.ingest({ type: 'turn/end', seq: 14, time: t0 + 2200, data: { turn: 4, reason: { kind: 'cancelled' } } } as never)
     if (ch.rows.length !== before) problems.push('phase0.85：空回合不应落结算行')
+  }
+
+  // ── Phase 0.86: box frames paint EVERY frame glyph with the border color ──
+  // A box whose straight runs fall back to the terminal's default foreground
+  // reads as a white line with four colored dots (the cmd.exe report).
+  {
+    const border = (text: string): string => `\x1b[34m${text}\x1b[39m`
+    const style = { bg: (text: string): string => text, border }
+    const top = boxTop(20, style)
+    const bottom = boxBottom(20, style)
+    const line = boxLine('hi', 20, style)
+    const blueRuns = (text: string): number => (text.match(/\x1b\[34m─+\x1b\[39m/g) ?? []).length
+    if (blueRuns(top) === 0) problems.push('phase0.86：boxTop 的横线未着边框色')
+    if (blueRuns(bottom) === 0) problems.push('phase0.86：boxBottom 的横线未着边框色')
+    if (!line.includes('\x1b[34m│\x1b[39m')) problems.push('phase0.86：boxLine 的竖线未着边框色')
   }
 
   // ── Phase 0.86: the thought row collapses the moment visible text starts

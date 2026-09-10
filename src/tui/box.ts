@@ -38,28 +38,41 @@ function inner(width: number): number {
   return Math.max(2, width - 2)
 }
 
-/** Top border: `╭─ title ──── [right]─╮`. `right` (pre-painted) hugs the corner. */
+/**
+ * Top border: `╭─ title ──── [right]─╮`. `right` (pre-painted) hugs the corner.
+ *
+ * Every glyph of the frame — corners, the horizontal run AND the title's own
+ * `─ ` furniture — is painted with the border color. Painting only the corners
+ * leaves the straight runs in the terminal's DEFAULT foreground, which reads
+ * as a white line with four blue dots (visible in cmd.exe).
+ */
 export function boxTop(width: number, style: BoxStyle, right?: string): string {
   const innerW = inner(width)
   let label = ''
   if (style.title) {
     const t = style.titlePaint ? style.titlePaint(style.title) : asciiEllipses(style.title)
-    label = `─ ${t} `
+    label = style.border('─ ') + t + ' '
   }
   const rightPart = right === undefined ? '' : ` ${asciiEllipses(right)}`
   const labelW = stringWidth(label)
   const rightW = stringWidth(rightPart)
   const fill = H.repeat(Math.max(1, innerW - labelW - rightW))
-  return style.bg(style.border(TL) + label + fill + rightPart + style.border(TR))
+  return style.bg(style.border(TL) + label + style.border(fill) + rightPart + style.border(TR))
 }
 
-/** Bottom border: `╰──[hint]───╯`. `hint` is pre-painted; truncated to fit. */
+/** Bottom border: `╰──[hint]───╯`. `hint` is pre-painted; dropped when it cannot fit. */
 export function boxBottom(width: number, style: BoxStyle, hint?: string): string {
   const innerW = inner(width)
-  let h = hint === undefined ? '' : `─ ${asciiEllipses(hint)} `
-  if (stringWidth(h) > innerW) h = truncateWidth(h, innerW)
-  const fill = H.repeat(Math.max(1, innerW - stringWidth(h)))
-  return style.bg(style.border(BL) + h + fill + style.border(BR))
+  const plain = hint === undefined ? '' : `─ ${asciiEllipses(hint)} `
+  // A hint that does not fit is DROPPED rather than truncated: truncating
+  // pre-painted text would either cut an escape sequence or mis-size the
+  // frame, and a border that wraps desyncs the whole diff painter.
+  const showHint = hint !== undefined && stringWidth(plain) <= innerW
+  const fill = H.repeat(Math.max(1, innerW - (showHint ? stringWidth(plain) : 0)))
+  const body = showHint
+    ? style.border('─ ') + asciiEllipses(hint) + style.border(' ') + style.border(fill)
+    : style.border(fill)
+  return style.bg(style.border(BL) + body + style.border(BR))
 }
 
 /**
