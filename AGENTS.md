@@ -14,6 +14,7 @@
 2. **插件契约三面**：`name` / `Config` / `apply`，无默认导出；所有配置键必须有默认值，插件缺失 = 什么都没发生，绝不让启动失败。
 3. **#183 纪律**：代码级 inject 为空；可选接缝全部软探测 + 静默降级（见 `src/app.ts` 的 `agents` 处理范例）。
 4. **Session 是真源**：UI 不持有会话真相；一切投影可从 `session/event` 重建（见 `src/adapter/channel.ts`）。注意 0.1.5 起日志里**没有 chunk 事件**：实时增量走 agent 作用域的 `agent/assistant-stream`，回放靠 `assistant/message` 的 message.content / stream。**模型路由也是会话真相**：唯一取法是内核那套顺序——最后一条未生效的 `model/selection` → 会话最后一次 `request/header`（`Session.requestHeader()`，`adapterDefaults.reasoningEffort` 的适配器默认值要丢掉）→ composition 默认（`agentDefaultModel`）；不要用「本进程上次选了什么」当答案（见 `src/app.ts` 的 `durableSelection`）。
+   **模型路由还有第二条观测面**：预设 persona 读 `{{model}}`，而 `dsh-agent-loop` 是从 `agent.options`（创建时的路由）注册这个变量的——所以切模型必须同时挂 `system-prompt/assemble` 把变量改写成当前选型，否则模型会一直自述成创建时的那个模型（真机会话日志可复现：persona 写 `minimax-m3`，同期请求走 `deepseek-v4-flash`）。请求侧按「装配时的快照」路由，避免一次步骤内提示词与请求各用一半。
 5. **TUI 活动期间 stdout 安静**：诊断走 stderr（`ORCA_DEBUG=1`），绝不 `console.log` 到 stdout。
 6. **事件落地规则**：Orca 目前只 append 一种 session 事件——`model/selection`（内核已知的 log-only 类型，形状与 web 端 `session.selectModel` 完全一致），不带 surface 元数据；不存在自造事件类型。将来若要新增，必须是 log-only 且能被安全跳过（优先复用内核已知类型；真正自造的类型要带 `ignorable: true`，0.1.5 起内核用事件自带的 `ignorable` 声明"跳过是否安全"而不是事件名注册）。
 7. **清理挂 `ctx.effect`**：每个 disposer 都要能在插件卸载时恢复终端/释放句柄。

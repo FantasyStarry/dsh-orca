@@ -153,7 +153,9 @@ test('rapid new-session requests release superseded creation before adopting the
     assert.equal(pendingOptions?.signal?.aborted, true)
     const abandoned = pendingOptions!.sessionId
     creation.resolve(h.handle(abandoned, [], async () => { disposedIds.push(abandoned) }))
-    await until(() => calls === 3 && h.state.attached === 8) // 2 adopted agents × 4 agent-scoped listeners
+    await until(() => calls === 3 && h.state.attached === 10) // 2 adopted agents × 5 agent-scoped listeners
+    // (agent/request, system-prompt/assemble, approval/request,
+    //  agent/assistant-stream, agent/request-notice … one per seam Orca owns)
     assert.equal(disposedIds.length, 2)
     assert.ok(disposedIds.includes(abandoned))
     h.input.text('hello\r')

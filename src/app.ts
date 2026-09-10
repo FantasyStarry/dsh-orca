@@ -1155,6 +1155,19 @@ export function bootstrapApp(
         dbg(`会话记录的模型：${recorded.provider}/${recorded.model}${recorded.reasoningEffort ?? ''}`)
         selection = recorded
         effortCleared = recorded.reasoningEffort === undefined
+      } else if (resumeId !== undefined) {
+        // A RESUMED session that records no route at all (created but never
+        // used, or a log without a request header): the kernel — and therefore
+        // the web — runs it on the composition default. Carrying this
+        // process's last pick in would make the TUI disagree with the
+        // session's own record, so fall back to the same default the kernel
+        // would use. Missing service = degrade to whatever was already there.
+        const fallback = defaultRoute()
+        if (fallback !== undefined) {
+          dbg(`会话无路由记录，回落到组合默认：${fallback.provider}/${fallback.model}`)
+          selection = fallback
+          effortCleared = fallback.reasoningEffort === undefined
+        }
       }
       attachAgent(created.agent)
     } catch (error) {
@@ -1197,6 +1210,23 @@ export function bootstrapApp(
       return false
     }
     return createAgent(signal, last.sessionId, true)
+  }
+
+  /**
+   * The composition default this deployment would create a new agent on
+   * (`agentDefaultModel`, `~/.dsh/settings.yaml`). Also the route the kernel
+   * falls back to for a session whose own log records nothing.
+   */
+  const defaultRoute = (): SessionRoute | undefined => {
+    const current = getDefaultModel()?.currentSelection()
+    if (current === undefined || current.provider === '' || current.model === '') return undefined
+    return {
+      provider: current.provider,
+      model: current.model,
+      ...(typeof current.reasoningEffort === 'string' && current.reasoningEffort !== ''
+        ? { reasoningEffort: current.reasoningEffort }
+        : {}),
+    }
   }
 
   const currentAgentOptions = (): { provider: string; model: string; reasoningEffort?: string } | undefined => {
@@ -1324,21 +1354,48 @@ export function bootstrapApp(
     } catch {
       // Keep last known policy.
     }
-    // Model selection, in the spirit of the kernel's `installModelSelection`
-    // (@deepseek-ai/dsh-agent/model-selection): the live selection overrides
-    // the resolved call config at request time, an ABSENT effort clears any
-    // inherited effort, and a provider/model change is announced to the model
-    // through a durable injected notice so it is not silently swapped under
-    // it. The kernel's helper itself is a runtime export of a kernel package
-    // and is deliberately NOT imported: an out-of-tree plugin resolves
-    // `@deepseek-ai/*` through the profile's module fallback, which on this
-    // machine still holds a stale 0.1.2-alpha.3 copy — importing it would
-    // install a foreign generation's waterfall over a 0.1.5 kernel.
+    // Model selection, mirroring the kernel's `installModelSelection`
+    // (@deepseek-ai/dsh-agent/model-selection) seam by seam. The kernel's
+    // helper is a runtime export of a kernel package and is deliberately NOT
+    // imported: an out-of-tree plugin resolves `@deepseek-ai/*` through the
+    // profile's module fallback, which on this machine still holds a stale
+    // 0.1.2-alpha.3 copy — importing it would install a foreign generation's
+    // waterfall over a 0.1.5 kernel.
+    //
+    // 1. `system-prompt/assemble` — the prompt's `{{provider}}` / `{{model}}`
+    //    variables must follow the LIVE selection. `dsh-agent-loop` registers
+    //    them from `agent.options.*`, i.e. the route the agent was CREATED
+    //    with, and the shipped presets' persona reads "You are a coding agent
+    //    powered by the {{model}} model." (verified in a real session log:
+    //    the persona still named the creation route after a switch). Without
+    //    this hook the session's own memory of which model it runs on is
+    //    stale — the model keeps telling the user the old name.
+    // 2. `agent/request` — apply the selection SNAPSHOT taken at assembly time
+    //    rather than whatever is live now, so a switch cannot split one step
+    //    (prompt assembled for A, request sent to B); a mid-step pick takes
+    //    effect from the next step. An absent effort clears the inherited one.
+    //    The `?? selection` fallback only matters for a harness that never
+    //    assembles (the fake kernel); the real kernel always assembles first.
+    // 3. the durable switch notice (below), so a model inheriting the
+    //    conversation knows the turns above it came from another model.
+    let assembledSelection: SessionRoute | undefined
+    const disposeAssemble = next.ctx.on('system-prompt/assemble', (...args: unknown[]) => {
+      const waterfallNext = args[args.length - 1] as () => Promise<Record<string, unknown>>
+      return (async (): Promise<Record<string, unknown>> => {
+        const assembled = await waterfallNext()
+        const live = selection
+        assembledSelection = live ?? undefined
+        if (!live) return assembled
+        const variables = recordOf(assembled['variables']) ?? {}
+        return { ...assembled, variables: { ...variables, provider: live.provider, model: live.model } }
+      })()
+    })
+    agentListenerDisposers.push(disposeAssemble)
     const disposeWaterfall = next.ctx.on('agent/request', (...args: unknown[]) => {
       const waterfallNext = args[1] as () => Promise<Record<string, unknown>>
       return (async (): Promise<Record<string, unknown>> => {
         const resolved = await waterfallNext()
-        const live = selection
+        const live = assembledSelection ?? selection
         if (!live) return resolved
         const { reasoningEffort: _inherited, ...rest } = resolved
         return {
@@ -1515,16 +1572,30 @@ export function bootstrapApp(
 
   /**
    * Announce a provider/model change to the MODEL, durably — the kernel's
-   * `installModelSelection` appends exactly such an injected user-role notice
-   * ("the model learns the policy/switch from the log"), and without it a
-   * silent 换模型 leaves the model reasoning about a route it is no longer
-   * on. Effort-only changes add nothing (matching the kernel's rule), and a
-   * repeat of the same route is never announced twice.
+   * `installModelSelection` adds exactly such a notice
+   * ("assistant turns above this point were generated by X; the session
+   * continues with Y"), and without it a silent 换模型 leaves the model
+   * reasoning about a route it is no longer on — and, just as bad, unaware
+   * that the turns above it were written by a different model. Effort-only
+   * changes add nothing (the kernel's rule), and a repeat of the same route is
+   * never announced twice.
+   *
+   * The "previous" anchor is what the MODEL believes: the last notice this
+   * process sent, else the route of the session's last request header (which
+   * survives a resume, a process restart, or a pick made in the web host).
    */
   const announceSelection = (next: SessionRoute): void => {
     if (!agent) return
-    const previous = announcedSelection
-    if (previous !== null && previous.provider === next.provider && previous.model === next.model) return
+    const headerRoute = routeOfHeader(agent.session)
+    const previous = announcedSelection ?? headerRoute ?? null
+    if (previous !== null && previous.provider === next.provider && previous.model === next.model) {
+      announcedSelection = { ...next }
+      return
+    }
+    const label = (route: SessionRoute, other: SessionRoute): string =>
+      route.provider === other.provider ? route.model : `${route.provider}/${route.model}`
+    const from = previous === null ? 'an earlier model' : label(previous, next)
+    const to = previous === null ? `${next.provider}/${next.model}` : label(next, previous)
     const effort = next.reasoningEffort !== undefined && next.reasoningEffort !== '' ? ` (reasoning effort: ${next.reasoningEffort})` : ''
     try {
       agent.inject({
@@ -1533,12 +1604,12 @@ export function bootstrapApp(
         content: [
           {
             type: 'text',
-            text: `[orca] The active model for this session is now ${next.provider}/${next.model}${effort}. Apply it from the next request onward.`,
+            text: `[model changed: assistant turns above this point were generated by ${from}; the session continues with ${to}${effort}.]`,
           },
         ],
         // `plugin` (never `user`): the notice is model-facing context, not a
         // human prompt — the transcript projection drops it.
-        source: { kind: 'plugin', plugin: 'orca' },
+        source: { kind: 'plugin', plugin: 'orca', form: 'notice', summary: `${from} → ${to}` },
       })
       announcedSelection = { ...next }
     } catch {

@@ -209,6 +209,8 @@ interface KernelRecord {
   /** Messages the plugin queued through `agent.inject` (model-facing context). */
   injected: UserMessage[]
   requestListener: ((...args: unknown[]) => unknown) | null
+  /** `system-prompt/assemble` waterfall (prompt variables follow the route). */
+  assembleListener: ((...args: unknown[]) => unknown) | null
   approvalListener: ((...args: unknown[]) => unknown) | null
   streamListener: ((...args: unknown[]) => unknown) | null
   policySet: string | null
@@ -234,6 +236,7 @@ class FakeKernel implements KernelContext {
     selectionSaved: null,
     injected: [],
     requestListener: null,
+    assembleListener: null,
     approvalListener: null,
     streamListener: null,
     policySet: null,
@@ -605,6 +608,24 @@ class FakeKernel implements KernelContext {
   }
 
   /**
+   * Run the Agent-scoped `system-prompt/assemble` waterfall the way the real
+   * kernel does — `(assembly, context, next)`, with `next()` returning the
+   * assembled prompt. The base variables are what `dsh-agent-loop` registers:
+   * the route the agent was CREATED with, which is exactly what a model
+   * switch has to override.
+   */
+  async assemblePrompt(): Promise<Record<string, unknown>> {
+    const created = this.record.createOptions?.agentOptions
+    const base: Record<string, unknown> = {
+      variables: { provider: created?.provider ?? '', model: created?.model ?? '', cwd: process.cwd() },
+    }
+    const listener = this.record.assembleListener
+    if (!listener) return base
+    const result = await listener(base, { agent: null }, async (): Promise<Record<string, unknown>> => base)
+    return result === undefined || result === null ? base : (result as Record<string, unknown>)
+  }
+
+  /**
    * Publish one live model-stream frame (dsh ≥ 0.1.5): the Agent-scoped
    * `agent/assistant-stream` event, NOT a session event. The transcript is
    * built from these while the turn runs; the durable `assistant/message`
@@ -658,6 +679,7 @@ class FakeKernel implements KernelContext {
         ctx: {
           on(name: string, listener: (...args: unknown[]) => unknown): () => void {
             if (name === 'agent/request') kernel.record.requestListener = listener
+            if (name === 'system-prompt/assemble') kernel.record.assembleListener = listener
             if (name === 'approval/request') kernel.record.approvalListener = listener
             if (name === 'agent/assistant-stream') kernel.record.streamListener = listener
             return () => {}
@@ -2086,6 +2108,20 @@ async function main(): Promise<void> {
     }
     if (kernel13.record.selectionSaved?.provider !== 'fake-a') {
       problems.push('phase12：/model 未写全局默认（settings）')
+    }
+    // The PROMPT must follow the pick too: dsh-agent-loop registers
+    // `{{provider}}`/`{{model}}` from the CREATION route, so without the
+    // `system-prompt/assemble` hook a switched session keeps telling the model
+    // (and the model keeps telling the user) that it runs on the old model.
+    {
+      const assembled = await kernel13.assemblePrompt()
+      const variables = (assembled['variables'] ?? {}) as Record<string, unknown>
+      if (variables['model'] !== 'fake-a-m1' || variables['provider'] !== 'fake-a') {
+        problems.push(`phase12：切换后系统提示词变量未跟随选型：${JSON.stringify(variables)}`)
+      }
+      if (assembled['variables'] === undefined) problems.push('phase12：assemble 未保留其余变量')
+      const cwdKept = (assembled['variables'] as Record<string, unknown> | undefined)?.['cwd']
+      if (cwdKept !== process.cwd()) problems.push(`phase12：assemble 覆盖了无关变量：${JSON.stringify(assembled['variables'])}`)
     }
     dispose13()
     await sleep(20)

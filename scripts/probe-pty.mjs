@@ -587,6 +587,32 @@ if (process.argv.includes('--features')) {
     const shown = screen.plainAll()
     if (!shown.includes('[file #1]')) fail(`[附件] user 行未投影 [file #1]\n${screen.plain()}`)
 
+    // 4) The SYSTEM PROMPT must have followed the switch. dsh-agent-loop
+    //    registers `{{model}}` from the agent's CREATION route and the shipped
+    //    presets' persona reads "powered by the {{model}} model", so a session
+    //    that switches models silently keeps telling the model it is the old
+    //    one unless the `system-prompt/assemble` seam is hooked. The assembled
+    //    prompts are durable `system/message` events: the LAST one must name
+    //    the model this probe switched to.
+    {
+      const sessionId = /session 已连接：(session-[0-9a-f-]+)/.exec(shown)?.[1]
+      const picked = /模型已切换：([^\s·]+)/.exec(shown)?.[1]
+      if (!sessionId) fail(`[提示词跟随] 读不到会话 id\n${screen.plain()}`)
+      if (!picked) fail(`[提示词跟随] 读不到切换后的路由\n${screen.plain()}`)
+      const path = findSessionLog(sessionId)
+      if (!path) fail(`[提示词跟随] 找不到会话日志：${sessionId}`)
+      const personas = readSessionEvents(path)
+        .filter((event) => event.type === 'system/message')
+        .map((event) => /powered by the ([^\s\\"]+) model/.exec(JSON.stringify(event.data ?? event))?.[1])
+        .filter((model) => typeof model === 'string')
+      const wanted = picked.split('/')[1]
+      if (personas.length === 0) fail('[提示词跟随] 日志里没有 persona 里的模型名')
+      if (personas.at(-1) !== wanted) {
+        fail(`[提示词跟随] 切换后系统提示词仍是旧模型：persona=${JSON.stringify(personas)}，路由=${picked}`)
+      }
+      console.log(`提示词跟随 ✔  persona 模型序列 ${JSON.stringify(personas)}（切换后 ${picked}）`)
+    }
+
     markSettledSafe(globalTimer)
     try {
       writeFileSync(probePath('probe-last-raw.log'), raw)
