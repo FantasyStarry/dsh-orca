@@ -8,27 +8,31 @@
  * source seam it mirrors; when a mirror drifts from the real surface, fix the
  * mirror and note the kernel version it was checked against.
  *
- * **Checked against `@deepseek-ai/dsh` v0.1.2-rc.1 (2026-09).** Shapes were
+ * **Checked against `@deepseek-ai/dsh` v0.1.5-rc.1 (2026-09).** Shapes were
  * read from the declaration files the installed kernel ships with itself
  * (`dsh/node_modules/@deepseek-ai/…/lib/types/*.d.ts`):
  *
  * - `dsh-agent`  → `AgentRegistry` (`ctx.agents`), `AgentHandle`, `Agent`,
- *   `AgentOptions` (carries `reasoningEffort` since 0.1.2), `CreateAgentOptions`
+ *   `AgentOptions` (carries `reasoningEffort`), `CreateAgentOptions`
  *   (`meta.agentPreset` lineage + creation-time `setup` composition hook),
- *   `ResumeAgentOptions`, `AgentCancelCause`, and the `agent/*` cordis events.
+ *   `ResumeAgentOptions`, `AgentCancelCause`, `AssistantStreamFrame`, and the
+ *   `agent/*` cordis events — **`agent/assistant-stream` is the live model
+ *   stream as of 0.1.5; the `assistant/chunk` session event no longer exists.**
  * - `dsh-agent-presets` → `AgentPresets` (`ctx.agentPresets`): roster
  *   (`list`/`resolve`), the user default (`defaultId`), per-agent live lookup
  *   (`composedPreset`) and standing-mount composition (`mount`, called from the
  *   agent factory `setup` hook — the only supported call site).
  * - `dsh-session` → `Session`, `SessionEvent`, `SessionEventMap`, and the
- *   `session/*` cordis events.
- * - `dsh-llm` → `StreamChunk`, `ContentBlock` (incl. `ImageBlock`), `UserMessage`
- *   / message roles, and the `LlmRuntime` selector surface — exact-route
- *   resolution is `resolveModelInfo(provider, model)` as of 0.1.2 (the old
- *   `resolveModel` name is gone from the runtime; Orca keeps a legacy-name
- *   fallback at the call site for older preview kernels).
+ *   `session/*` cordis events. The appendable surface is `assistant/message`
+ *   (embedding the attempt `stream`), `assistant/attempt`, `system/message`,
+ *   and the log-only boundary/audit events — there is no chunk event.
+ * - `dsh-llm` → `StreamChunk`, `ContentBlock` (incl. `ImageBlock` / the
+ *   0.1.5 `FileBlock`), message roles, and the `LlmRuntime` selector surface —
+ *   exact-route resolution is `resolveModelInfo(provider, model)` (the name
+ *   `resolveModel` never existed on the runtime).
  * - `dsh-attachment` → `AttachmentStore` (`ctx.attachments`): durable image
- *   admission (`saveImage`) + limits. Optional seam, soft-probed.
+ *   admission (`saveImage`) + limits, and the 0.1.5 file path. Optional seam,
+ *   soft-probed.
  * - `dsh-file-reference` → `FileReferenceService` (`ctx.fileReferences`):
  *   cancellable `@path` completion candidates. Optional seam, soft-probed.
  *
@@ -36,11 +40,12 @@
  * - `SessionId` / `CallId` / `MessageId` are branded strings in the kernel;
  *   brands are compile-time only, so the mirrors use plain `string` and the
  *   runtime accepts plain JSON of the same shape.
- * - `SessionEventMap` mirrors only the core types Orca consumes; plugin-merged
- *   extensions (`agent/inbox/spliced`, compaction, …) and `request/header` /
- *   `request/context` are intentionally absent — unknown event types are
- *   ignored at the channel boundary.
- * - `CreateAgentOptions` / `ResumeAgentOptions` omit `seed` until Orca uses it.
+ * - `SessionEventMap` mirrors only the types Orca consumes; plugin-merged
+ *   extensions (compaction, hooks, `session/title`, `command/*`, the `agent/*`
+ *   log events, …) are intentionally absent — unknown event types are ignored
+ *   at the channel boundary.
+ * - `CreateAgentOptions` / `ResumeAgentOptions` omit `seed`/`parentAgent`
+ *   until Orca uses them.
  */
 
 // ── dsh-llm: content blocks and messages ────────────────────────────────────
@@ -133,18 +138,36 @@ export interface ImageBlock {
 }
 
 /**
- * Provider-neutral content block (dsh-llm `ContentBlock`). Unknown
- * plugin-merged blocks never match a `type` check and are ignored.
+ * Provider-neutral content block (dsh-llm `ContentBlock`; `ContentBlockMap`
+ * keys, incl. `file` since 0.1.5). Unknown plugin-merged blocks never match a
+ * `type` check and are ignored.
  */
-export type ContentBlock = TextBlock | ReasoningBlock | ImageBlock | ToolCallBlock | ToolResultBlock
+export type ContentBlock = TextBlock | ReasoningBlock | ImageBlock | FileBlock | ToolCallBlock | ToolResultBlock
+
+/** A durable NON-image attachment reference (dsh-attachment `FileAttachmentRef`). */
+export interface FileAttachmentRef {
+  readonly attachmentId: string
+  readonly name: string
+  readonly bytes: number
+}
 
 /**
- * Raw streaming protocol carried by `assistant/chunk` (dsh-llm `StreamChunk`).
- * Visible text arrives as `text-delta` / `reasoning-delta`; the other
- * variants carry no transcript text for Orca's purposes — but a `block-end`
- * assembling a reasoning block is the end-of-thinking signal that collapses
- * the thought row (delta-only protocols without block framing fall back to
- * sealing on the first `text-delta`).
+ * A durable file reference in user content (dsh-llm `FileBlock`, new in
+ * 0.1.5). Role-neutral like `ImageBlock`.
+ */
+export interface FileBlock {
+  readonly type: 'file'
+  readonly attachment: FileAttachmentRef
+}
+
+/**
+ * Raw streaming protocol carried by live `agent/assistant-stream` chunk
+ * frames and embedded in durable assistant settlements (dsh-llm
+ * `StreamChunk`). Visible text arrives as `text-delta` / `reasoning-delta`;
+ * the other variants carry no transcript text for Orca's purposes — but a
+ * `block-end` assembling a reasoning block is the end-of-thinking signal
+ * that collapses the thought row (delta-only protocols without block framing
+ * fall back to sealing on the first `text-delta`).
  */
 export type StreamChunk =
   | { readonly type: 'block-start'; readonly index: number; readonly blockType: string }
@@ -152,8 +175,34 @@ export type StreamChunk =
   | { readonly type: 'reasoning-delta'; readonly index: number; readonly text: string }
   | { readonly type: 'tool-call-delta'; readonly index: number; readonly id: string; readonly name?: string; readonly argumentsDelta: string }
   | { readonly type: 'block-end'; readonly index: number; readonly block: ContentBlock }
-  | { readonly type: 'usage'; readonly usage: Record<string, unknown> }
+  | { readonly type: 'usage'; readonly usage: TokenUsage }
   | { readonly type: 'finish'; readonly reason: { readonly kind: string } }
+
+/**
+ * One live assistant-stream publication (`agent/assistant-stream`, dsh-agent
+ * `AssistantStreamFrame`, new in 0.1.5). This is the ONLY live delta channel:
+ * chunks are transient and never enter the session log. `start` opens an
+ * attempt, `chunk` carries one ordered `StreamChunk`, `end` reports the
+ * settlement (the durable `assistant/message`/`assistant/attempt` event).
+ */
+export type AssistantStreamFrame =
+  | { readonly type: 'start'; readonly attemptId: string; readonly revision: number; readonly turn: number; readonly step: number }
+  | {
+      readonly type: 'chunk'
+      readonly attemptId: string
+      readonly revision: number
+      /** Dense zero-based position within the attempt. */
+      readonly index: number
+      readonly time: number
+      readonly chunk: StreamChunk
+    }
+  | {
+      readonly type: 'end'
+      readonly attemptId: string
+      readonly revision: number
+      readonly index: number
+      readonly outcome: { readonly kind: 'committed'; readonly eventType: string; readonly seq: number } | { readonly kind: 'abandoned' }
+    }
 
 // ── dsh-session: the event log (source of truth) ────────────────────────────
 
@@ -180,14 +229,34 @@ export interface SessionEventMap {
   'step/start': { readonly turn: number; readonly step: number }
   'step/end': { readonly turn: number; readonly step: number }
   'user/message': UserMessage
-  'assistant/chunk': { readonly turn: number; readonly step: number; readonly chunk: StreamChunk }
-  'assistant/message': { readonly turn: number; readonly step: number; readonly message: AssistantMessage; readonly usage?: TokenUsage; readonly interrupted?: true }
+  /** The rendered system prompt — surface node 0 (new as a logged event in 0.1.5). */
+  'system/message': { readonly turn: number; readonly step: number; readonly message: Message }
+  /**
+   * Assembled assistant message for one step (dsh 0.1.5): carries the
+   * `stream` records that REPLACED the old `assistant/chunk` events, so a
+   * replayed log has no chunks — only this and the message content.
+   */
+  'assistant/message': {
+    readonly turn: number
+    readonly step: number
+    readonly message: AssistantMessage
+    readonly stream?: readonly unknown[]
+    readonly usage?: TokenUsage
+    readonly interrupted?: true
+  }
+  /** One model attempt that committed no surface message (failure/retry/cancel). */
+  'assistant/attempt': { readonly turn: number; readonly step: number; readonly stream?: readonly unknown[] }
   'tool/call': { readonly turn: number; readonly step: number; readonly callId: string; readonly name: string; readonly arguments: string }
   'tool/result': { readonly turn: number; readonly step: number; readonly message: ToolResultMessage; readonly error?: { readonly name: string; readonly code: string } }
   'todo/write': { readonly todos: readonly TodoItem[] }
   /** Full request header snapshot; the latest one reconstructs the route (dsh-session `EpochHeader`). */
   'request/header': { readonly header: { readonly config: LlmCallConfig }; readonly reason: string }
-  'session/end-seed': Record<string, never>
+  /** Durable approval override (`dsh-user-approval`); the LAST one wins. */
+  'approval/policy': { readonly policy: KernelApprovalPolicy; readonly source?: 'delegation' }
+  /** Approval audit pair (`dsh-user-approval`, log-only, paired by `id`). */
+  'approval/asked': { readonly id: string; readonly toolName: string; readonly callId?: string; readonly reason?: string }
+  'approval/decided': { readonly id: string; readonly outcome: string }
+  'session/end-seed': { readonly inherited?: true }
 }
 
 export type SessionEventType = keyof SessionEventMap
@@ -206,6 +275,7 @@ export interface LlmCallConfig {
 export interface TokenUsage {
   readonly inputTokens: number
   readonly outputTokens: number
+  readonly totalTokens?: number
   readonly cacheReadTokens?: number
   readonly cacheWriteTokens?: number
   readonly reasoningTokens?: number
@@ -227,6 +297,8 @@ export interface LlmModelInfo {
   /** Human-readable model name for selectors. */
   readonly name: string
   readonly description?: string
+  /** Modalities the route accepts ('text' | 'image'). */
+  readonly inputModalities?: readonly string[]
 }
 
 /** Adapter-owned reasoning effort metadata (dsh-llm `LlmReasoningEffortInfo`). */
@@ -238,10 +310,15 @@ export interface LlmReasoningEffortInfo {
 
 /** Exact-route model metadata resolved by its adapter (dsh-llm `LlmResolvedModelInfo`). */
 export interface LlmResolvedModelInfo extends LlmModelInfo {
+  /** Advertised capacity of the route. */
+  readonly context?: { readonly contextWindow: number }
+  readonly defaultMaxTokens?: number
   readonly reasoning?: {
     readonly efforts: readonly LlmReasoningEffortInfo[]
     readonly defaultEffort?: string
   }
+  /** `'in-history'` when the route reads the latest `system` message in history. */
+  readonly systemPromptUpdate?: string
 }
 
 /**
@@ -283,14 +360,17 @@ export interface SessionEvent {
  */
 export interface Session {
   readonly id: string
-  /** Legacy preview snapshot; current kernels use snapshotEvents(). */
-  readonly events?: readonly SessionEvent[]
-  /** dsh 0.1.2-rc.1 snapshot API; older previews expose `events` instead. */
-  snapshotEvents?(): readonly SessionEvent[]
+  /**
+   * Materialize an immutable snapshot of the log (dsh 0.1.5 `snapshotEvents`).
+   * This is the ONLY snapshot API — the preview-era `session.events` field no
+   * longer exists in the kernel and is not mirrored.
+   */
+  snapshotEvents(fromSeq?: number, toSeqExclusive?: number): readonly SessionEvent[]
   /**
    * Append one event. The real signature is strongly typed per event type and
-   * requires surface metadata for surface types — Orca only appends log-only
-   * types, so the mirror stays permissive.
+   * requires surface metadata for surface types (`system/message`,
+   * `user/message`, `assistant/message`, `tool/result`) — Orca appends no
+   * events at all today, so the mirror stays on the log-only shape.
    */
   append(type: string, data: Record<string, unknown>): SessionEvent
 }
@@ -552,10 +632,24 @@ export interface KernelCommandExecution {
   readonly result: { readonly kind: 'success'; readonly text?: string } | { readonly kind: 'error'; readonly text: string }
 }
 
+/**
+ * One attachment handed to a kernel command (dsh-commands
+ * `CommandSubmitAttachment`): an inline encoded image, or the receipt id of a
+ * file the caller already admitted through the attachment store.
+ */
+export type KernelCommandSubmitAttachment =
+  | { readonly type: 'image'; readonly mediaType: ImageMediaType; readonly data: string; readonly name?: string }
+  | { readonly type: 'file'; readonly receiptId: string }
+
 export interface KernelCommandsService {
   list(agent: Agent): readonly KernelCommandDescriptor[]
   find(agent: Agent, name: string): { readonly name: string } | undefined
-  execute(agent: Agent, line: string, images: readonly unknown[], signal: AbortSignal): Promise<KernelCommandExecution | undefined>
+  execute(
+    agent: Agent,
+    line: string,
+    submittedAttachments: readonly KernelCommandSubmitAttachment[],
+    signal: AbortSignal,
+  ): Promise<KernelCommandExecution | undefined>
 }
 
 /**
@@ -624,6 +718,12 @@ export interface KernelApprovalRequest {
 export type KernelApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
 
 export interface KernelApprovalService {
+  /**
+   * The deployment's configured default policy (`never` under a headless/
+   * full-access composition). Reported when the session log carries no
+   * override — without it the footer would claim `ask` on a `never` profile.
+   */
+  readonly config?: { readonly policy?: KernelApprovalPolicy }
   setPolicy(agent: Agent, policy: KernelApprovalPolicy): void
   overrideOf(session: Session): KernelApprovalPolicy | undefined
   request(req: KernelApprovalRequest): Promise<KernelApprovalOutcome>
@@ -640,6 +740,7 @@ export interface KernelAttachmentLimits {
   readonly maxImageBytes: number
   readonly maxImagesPerMessage: number
   readonly maxMessageImageBytes: number
+  readonly maxImagePixels: number
   readonly maxImageDimension: number
   readonly mediaTypes: readonly ImageMediaType[]
 }
@@ -709,6 +810,8 @@ export type KernelAppExit = (code: number) => void
  * - `session/disposed` → `(session)` emit
  * - `agent/status` → `({ agent, status })` emit
  * - `agent/error` → `({ agent, turn, step, error })` emit
+ * - `agent/assistant-stream` → `({ agent, frame })` emit (dsh ≥ 0.1.5, the
+ *   live model-stream publication; agent-scoped)
  * - `approval/request` → `(req, next)` waterfall (scoped to the agent)
  * - `commands/change` → `()` emit (command list changed)
  * Payloads are parsed defensively either way.
@@ -716,6 +819,7 @@ export type KernelAppExit = (code: number) => void
 export const KERNEL_EVENTS = {
   sessionEvent: 'session/event',
   agentStatus: 'agent/status',
+  assistantStream: 'agent/assistant-stream',
   sessionDisposed: 'session/disposed',
   agentError: 'agent/error',
   approvalRequest: 'approval/request',

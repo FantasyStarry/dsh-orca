@@ -7,11 +7,14 @@
  * their tool row, and turn boundaries just mark state. Nothing here is
  * persisted; everything can be rebuilt from `session/event` replay.
  *
- * Event shapes mirror dsh v0.1.1-rc.2 (see src/kernel/types.ts): the payload
- * lives under `event.data` — `assistant/chunk` carries a `StreamChunk` whose
- * `text-delta` / `reasoning-delta` variants are the real streaming deltas
- * the old ACP wire protocol never had. Parsing stays defensive: unknown
- * event types are ignored, legacy flat payloads still parse.
+ * Event shapes mirror dsh v0.1.5-rc.1 (see src/kernel/types.ts): the payload
+ * lives under `event.data`. Since 0.1.5 the log carries NO chunk events — a
+ * live turn streams through the Agent-scoped codis event
+ * `agent/assistant-stream` (`ingestStreamFrame`), and the durable
+ * `assistant/message` embeds the same stream plus the assembled message.
+ * Replayed logs therefore rebuild the assistant text from the message content
+ * (`settleAssistant`), while live deltas append to the open row. Parsing stays
+ * defensive: unknown event types are ignored, legacy flat payloads still parse.
  */
 
 import type { SessionEvent, StreamChunk, TodoItem } from '../kernel/types.js'
@@ -114,7 +117,7 @@ function str(record: Record<string, unknown>, ...keys: string[]): string {
   return ''
 }
 
-function isStreamChunk(value: unknown): value is StreamChunk {
+export function isStreamChunk(value: unknown): value is StreamChunk {
   const record = recordOf(value)
   if (!record) return false
   const type = record['type']
@@ -131,11 +134,16 @@ function isStreamChunk(value: unknown): value is StreamChunk {
 
 /** Join the text of all `text` blocks in a content array. */
 function blockText(content: unknown): string {
+  return blockTextOf(content, 'text')
+}
+
+/** Join the `text` field of every block of one kind in a content array. */
+function blockTextOf(content: unknown, type: 'text' | 'reasoning'): string {
   if (!Array.isArray(content)) return ''
   const parts: string[] = []
   for (const item of content) {
     const block = recordOf(item)
-    if (block && block['type'] === 'text' && typeof block['text'] === 'string') {
+    if (block && block['type'] === type && typeof block['text'] === 'string') {
       parts.push(block['text'])
     }
   }
@@ -144,11 +152,16 @@ function blockText(content: unknown): string {
 
 /** Count durable image references in a content array (defensive). */
 function countImageBlocks(content: unknown): number {
+  return countBlocksOfType(content, 'image')
+}
+
+/** Count blocks of one type in a content array (defensive). */
+function countBlocksOfType(content: unknown, type: string): number {
   if (!Array.isArray(content)) return 0
   let count = 0
   for (const item of content) {
     const block = recordOf(item)
-    if (block && block['type'] === 'image') count++
+    if (block && block['type'] === type) count++
   }
   return count
 }
@@ -156,6 +169,11 @@ function countImageBlocks(content: unknown): number {
 /** Claude Code style `[image #1] [image #2]` for user rows. */
 function imageLabels(count: number): string {
   return Array.from({ length: count }, (_, i) => `[image #${i + 1}]`).join(' ')
+}
+
+/** `[file #1] [file #2]` for non-image attachments (dsh-llm `FileBlock`). */
+function fileLabels(count: number): string {
+  return Array.from({ length: count }, (_, i) => `[file #${i + 1}]`).join(' ')
 }
 
 /** Pull the model-facing text out of a `tool/result` event's message. */
@@ -322,6 +340,53 @@ export class Channel {
   private openAssistantId: number | null = null
   private openThoughtId: number | null = null
   private readonly pendingTools = new Map<string, TranscriptRow>()
+  /**
+   * True once a live model-stream delta reached this step. The durable
+   * `assistant/message` then only RECONCILES the streamed text; without any
+   * delta (a replayed log, or a non-streaming adapter) it is the only source
+   * of the assistant/thought text and projects it itself.
+   */
+  private streamedThisStep = false
+
+  /**
+   * Live model-stream ingest (`agent/assistant-stream` chunk frames, dsh
+   * 0.1.5). The log no longer carries chunk events, so this is the only path
+   * that renders a turn while it is happening.
+   */
+  ingestStreamChunk(chunk: StreamChunk): void {
+    this.streamedThisStep = true
+    if (chunk.type === 'text-delta' && chunk.text) {
+      // Visible text means the model stopped reasoning: collapse the thought
+      // row now instead of leaving the spinner running under the streaming
+      // answer. This is also the only end-of-reasoning signal on delta-only
+      // protocols that never emit `block-end`.
+      this.sealThought()
+      this.appendChunk('assistant', 'assistant', chunk.text)
+    } else if (chunk.type === 'reasoning-delta' && chunk.text) {
+      this.appendChunk('thought', 'thought', chunk.text)
+    } else if (chunk.type === 'block-end') {
+      // `block-end` carries the assembled block: a reasoning block closing
+      // collapses the thought row to its `已思考 Ns` summary. Other block
+      // kinds change nothing visible on their own.
+      const block = recordOf(chunk.block)
+      if (block && block['type'] === 'reasoning') this.sealThought()
+    }
+    // block-start / usage / finish / tool-call-delta carry no transcript
+    // text here; tool activity projects from tool/call and tool/result
+    // events.
+    this.advanceSeal()
+  }
+
+  /**
+   * A new model attempt opened (frame `start`): the previous attempt's live
+   * rows are finished, so its text can no longer grow.
+   */
+  beginAttempt(): void {
+    this.sealThought()
+    this.openAssistantId = null
+    this.streamedThisStep = false
+    this.advanceSeal()
+  }
 
   ingest(event: SessionEvent): void {
     if (typeof event.seq === 'number' && Number.isFinite(event.seq)) {
@@ -339,6 +404,7 @@ export class Channel {
           this.version++
         }
         this.runState = 'thinking'
+        this.streamedThisStep = false
         // Open the token window for the new turn; the previous turn's summary
         // (if any) already landed on its `turn/end`.
         this.turnStartMs = eventMs(event)
@@ -347,6 +413,11 @@ export class Channel {
         this.turnReasoningTokens = 0
         this.turnCacheRead = 0
         this.turnCacheWrite = 0
+        break
+      }
+      case 'step/start': {
+        // Steps run one model call each: a new step starts a fresh row.
+        this.beginAttempt()
         break
       }
       case 'request/header': {
@@ -390,10 +461,11 @@ export class Channel {
           this.turnCacheWrite += cacheWrite
           this.version++
         }
-        // The message is complete: close the open assistant row so it
-        // sediments into scrollback immediately instead of staying live
-        // until the next tool call or turn boundary.
-        this.openAssistantId = null
+        // The message is complete: settle the assistant text (live deltas
+        // already rendered it; a replayed log projects it from here) and
+        // close the row so it sediments into scrollback immediately.
+        const message = recordOf(data['message'])
+        this.settleAssistant(blockTextOf(message?.['content'], 'text'), blockTextOf(message?.['content'], 'reasoning'))
         break
       }
       case 'turn/end': {
@@ -442,39 +514,41 @@ export class Channel {
         if (source && str(source, 'kind') !== 'user') break
         const text = blockText(data['content']) || str(data, 'text')
         const images = countImageBlocks(data['content'])
-        const label = text || (images > 0 ? '' : '…')
-        const suffix = images > 0 ? (text ? ` ${imageLabels(images)}` : imageLabels(images)) : ''
+        // dsh 0.1.5 adds `file` blocks for non-image attachments; they must
+        // label the row instead of degrading to a bare `…`.
+        const files = countBlocksOfType(data['content'], 'file')
+        const label = text || (images > 0 || files > 0 ? '' : '…')
+        const labels = [images > 0 ? imageLabels(images) : '', files > 0 ? fileLabels(files) : '']
+          .filter((part) => part !== '')
+          .join(' ')
+        const suffix = labels !== '' ? (text ? ` ${labels}` : labels) : ''
         if (label || suffix) this.pushUser(label + suffix)
         break
       }
+      case 'assistant/attempt': {
+        // A model attempt that committed no surface message (failure, retry,
+        // cancellation). It carries only the raw stream — nothing to project —
+        // but it does end whatever was streaming.
+        this.beginAttempt()
+        break
+      }
       case 'assistant/chunk': {
+        // LEGACY (dsh ≤ 0.1.2): chunks used to be *session events*. The 0.1.5
+        // kernel no longer writes them; kept so older persisted logs and the
+        // fake kernel still project. Live turns stream via
+        // `ingestStreamChunk` instead.
         const data = dataOf(event)
         const chunk = data['chunk']
         if (isStreamChunk(chunk)) {
-          if (chunk.type === 'text-delta' && chunk.text) {
-            // Visible text means the model stopped reasoning: collapse the
-            // thought row now instead of leaving the spinner running under
-            // the streaming answer. This is also the only end-of-reasoning
-            // signal on delta-only protocols that never emit `block-end`.
-            this.sealThought()
-            this.appendChunk('assistant', 'assistant', chunk.text)
-          } else if (chunk.type === 'reasoning-delta' && chunk.text) {
-            this.appendChunk('thought', 'thought', chunk.text)
-          } else if (chunk.type === 'block-end') {
-            // `block-end` carries the assembled block: a reasoning block
-            // closing collapses the thought row to its `已思考 Ns` summary.
-            // Other block kinds change nothing visible on their own.
-            const block = recordOf(chunk.block)
-            if (block && block['type'] === 'reasoning') this.sealThought()
-          }
-          // block-start / usage / finish / tool-call-delta carry no
-          // transcript text here; tool activity projects from tool/call and
-          // tool/result events.
+          this.ingestStreamChunk(chunk)
           break
         }
         // Legacy flat shape: a bare text field on the event payload.
         const text = str(data, 'text', 'delta')
-        if (text) this.appendChunk('assistant', 'assistant', text)
+        if (text) {
+          this.streamedThisStep = true
+          this.appendChunk('assistant', 'assistant', text)
+        }
         break
       }
       case 'tool/call': {
@@ -773,6 +847,40 @@ export class Channel {
       row.seconds = Math.round((Date.now() - row.startMs) / 100) / 10
     }
     this.openThoughtId = null
+  }
+
+  /**
+   * Settle one completed assistant message into the transcript.
+   *
+   * LIVE: the deltas already painted the rows, so the durable text only
+   * reconciles them (the message is authoritative — a stream that was cut
+   * short or a non-streaming adapter both land here).
+   *
+   * REPLAY: the log carries no chunks at all (dsh ≥ 0.1.5), so the message
+   * content is the ONLY source of the reasoning/answer text.
+   */
+  private settleAssistant(text: string, reasoning: string): void {
+    this.sealThought()
+    const openId = this.openAssistantId
+    const open = openId === null ? undefined : this.rows.find((row) => row.id === openId)
+    this.openAssistantId = null
+    if (open) {
+      // Live row: the durable text is authoritative (it also covers a stream
+      // the adapter cut short).
+      if (text && open.text !== text) {
+        open.text = text
+        open.seq = ++this.version
+      }
+      return
+    }
+    // No live row — either a replay, or a stream that carried no text delta.
+    if (reasoning && !this.streamedThisStep) {
+      // Durable reasoning with no live timer: collapse it immediately so the
+      // replayed row matches the sealed shape of a live one.
+      this.rows.push({ id: ++rowId, kind: 'thought', text: reasoning, seconds: 0, seq: ++this.version })
+    }
+    if (text) this.rows.push({ id: ++rowId, kind: 'assistant', text, seq: ++this.version })
+    this.version++
   }
 
   private appendChunk(kind: Extract<RowKind, 'assistant' | 'thought'>, openKind: 'assistant' | 'thought', text: string): void {

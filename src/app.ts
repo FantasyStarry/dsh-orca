@@ -21,7 +21,7 @@ import { spawn } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync, unlinkSync, appendFileSync, writeFileSync } from 'node:fs'
 import { basename, isAbsolute, join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
-import { Channel } from './adapter/channel.js'
+import { Channel, isStreamChunk } from './adapter/channel.js'
 import type { SessionRoute } from './adapter/channel.js'
 import type { OrcaConfig } from './index.js'
 import type {
@@ -51,6 +51,7 @@ import type {
   KernelSessionTitleService,
   KernelSessionsService,
   SessionEvent,
+  StreamChunk,
   TodoItem,
   UserMessage,
 } from './kernel/types.js'
@@ -571,7 +572,10 @@ export function bootstrapApp(
     const approval = getApproval()
     if (agent && approval) {
       try {
-        const override = approval.overrideOf(agent.session)
+        // Session override first, then the DEPLOYMENT default (a headless /
+        // full-access composition configures `never`) — only then the local
+        // estimate, which is what an unconfigured `ask` kernel would use.
+        const override = approval.overrideOf(agent.session) ?? approval.config?.policy
         const effective = override ?? approvalPolicy
         channel.pushSystem(`审批策略：${effective}${yoloMode ? ' · yolo 开（自动放行单次）' : ''}（ask = 逐次确认，never = 全拒绝）`)
         return
@@ -1064,10 +1068,9 @@ export function bootstrapApp(
       let events: readonly SessionEvent[] = []
       try {
         if (created.agent.session.snapshotEvents) events = created.agent.session.snapshotEvents()
-        else if (resumeId) events = (await getSessionQuery()?.readSession(resumeId))?.events ?? created.agent.session.events ?? []
-        else events = created.agent.session.events ?? []
+        else if (resumeId) events = (await getSessionQuery()?.readSession(resumeId))?.events ?? []
       } catch {
-        events = created.agent.session.events ?? []
+        events = []
       }
       if (disposed || signal.aborted) {
         await created.dispose()
@@ -1180,7 +1183,8 @@ export function bootstrapApp(
       }
     }
     try {
-      const override = getApproval()?.overrideOf(next.session)
+      const approval = getApproval()
+      const override = approval?.overrideOf(next.session) ?? approval?.config?.policy
       if (override) approvalPolicy = override
     } catch {
       // Keep last known policy.
@@ -1246,6 +1250,34 @@ export function bootstrapApp(
       return askUserQuestions({ questions, agent: req['agent'], ...(signal ? { signal } : {}) })
     })
     agentListenerDisposers.push(disposeUserQuestions)
+
+    // Live model streaming (dsh ≥ 0.1.5). The session log no longer records
+    // chunks — a live turn publishes `agent/assistant-stream` frames on the
+    // AGENT scope instead, and the durable `assistant/message` settles them.
+    // Without this listener the transcript would only fill in at step end.
+    const disposeStream = next.ctx.on(KERNEL_EVENTS.assistantStream, (...args: unknown[]) => {
+      if (disposed) return
+      const payload = recordOf(args[0])
+      const subject = recordOf(payload?.['agent'])
+      // Defence in depth: the listener is already agent-scoped, but a frame
+      // for another agent must never touch this transcript.
+      if (subject && subject['id'] !== targetSessionId) return
+      const frame = recordOf(payload?.['frame'])
+      if (!frame) return
+      const kind = frame['type']
+      if (kind === 'start') {
+        channel.beginAttempt()
+        return
+      }
+      if (kind !== 'chunk') {
+        // `end` reports settlement bookkeeping (attemptId/revision/outcome);
+        // the durable event owns the transcript, so nothing to project.
+        return
+      }
+      const chunk = frame['chunk']
+      if (isStreamChunk(chunk)) channel.ingestStreamChunk(chunk as StreamChunk)
+    })
+    agentListenerDisposers.push(disposeStream)
   }
 
   // ── /model picker ─────────────────────────────────────────────────────────
@@ -1399,12 +1431,11 @@ export function bootstrapApp(
       void (async (): Promise<void> => {
         const items: PickerItem[] = [itemOf('默认（模型默认行为）', '')]
         try {
-          // dsh 0.1.2 renamed the exact-route resolution to `resolveModelInfo`;
-          // stale preview kernels still carry `resolveModel` — try both.
-          const llmAny = llm as unknown as { resolveModelInfo?: KernelLlmService['resolveModelInfo']; resolveModel?: KernelLlmService['resolveModelInfo'] }
-          const resolve = llmAny.resolveModelInfo?.bind(llm) ?? llmAny.resolveModel?.bind(llm)
-          if (!resolve) throw new Error('llm 服务未提供 resolveModelInfo')
-          const resolved = await resolve(provider, model)
+          // Exact-route resolution (dsh `LlmRuntime.resolveModelInfo`). The
+          // preview-era `resolveModel` name never existed on the runtime — it
+          // only ever named the adapter base class method — so there is no
+          // legacy fallback to keep.
+          const resolved = await llm.resolveModelInfo(provider, model)
           for (const effort of resolved?.reasoning?.efforts ?? []) {
             items.push(itemOf(effort.name || effort.id, effort.id, effort.description))
           }
@@ -1698,7 +1729,10 @@ export function bootstrapApp(
       child = sessions.fork(agent.session, boundary, childId) as unknown as { id: string }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      if (/OPEN_TURN/i.test(message)) {
+      // dsh-session's SessionForkError carries a typed `code`; the message text
+      // never contains the literal 'OPEN_TURN'.
+      const code = typeof (error as { code?: unknown }).code === 'string' ? (error as { code: string }).code : ''
+      if (code === 'OPEN_TURN' || /OPEN_TURN/i.test(message)) {
         channel.pushSystem('回退失败：边界落在未闭合回合内，稍后重试')
       } else {
         channel.pushSystem(`回退失败：${message}`)

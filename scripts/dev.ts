@@ -40,6 +40,20 @@ import type {
 const sleep = (ms: number): Promise<void> => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
 /**
+ * The durable log a resumed session replays: the real kernel loads the stored
+ * events into the reconstructed Session, so `snapshotEvents()` (not a query
+ * fallback) is what a remount projects.
+ */
+function durableHistory(): SessionEvent[] {
+  const now = Date.now()
+  return [
+    { type: 'turn/start', seq: 0, time: now, data: { turn: 1 } },
+    { type: 'user/message', seq: 1, time: now, data: { content: [{ type: 'text', text: 'hi 历史' }], source: { kind: 'user' } } },
+    { type: 'turn/end', seq: 2, time: now, data: { turn: 1, reason: { kind: 'completed' } } },
+  ] as SessionEvent[]
+}
+
+/**
  * Minimal terminal emulator for the renderer contract: replays the write
  * stream (cursor up/down, clear-line, clear-to-end, newline) onto a screen
  * buffer so tests can assert the VISIBLE frame, not just that bytes moved.
@@ -190,6 +204,7 @@ interface KernelRecord {
   selectionSaved: { provider: string; model: string; reasoningEffort?: string } | null
   requestListener: ((...args: unknown[]) => unknown) | null
   approvalListener: ((...args: unknown[]) => unknown) | null
+  streamListener: ((...args: unknown[]) => unknown) | null
   policySet: string | null
   titleRenamed: string | null
   compactLine: string | null
@@ -213,6 +228,7 @@ class FakeKernel implements KernelContext {
     selectionSaved: null,
     requestListener: null,
     approvalListener: null,
+    streamListener: null,
     policySet: null,
     titleRenamed: null,
     compactLine: null,
@@ -300,18 +316,7 @@ class FakeKernel implements KernelContext {
             status: 'fulfilled' as const,
             value: sessionId === 'session-aaa' ? { title: { title: '假标题A', updatedAt: Date.now() } } : {},
           })),
-        readSession: async (_sessionId: string) => ({
-          events: [
-            { type: 'turn/start', seq: 0, time: Date.now(), data: { turn: 1 } },
-            {
-              type: 'user/message',
-              seq: 1,
-              time: Date.now(),
-              data: { content: [{ type: 'text', text: 'hi 历史' }], source: { kind: 'user' } },
-            },
-            { type: 'turn/end', seq: 2, time: Date.now(), data: { turn: 1, reason: { kind: 'completed' } } },
-          ],
-        }),
+        readSession: async (_sessionId: string) => ({ events: durableHistory() }),
       } as T
     }
     if (name === 'sessionTitle') {
@@ -425,9 +430,35 @@ class FakeKernel implements KernelContext {
   /** Publish one session event through the real `(session, event)` shape. */
   emit(type: string, data: unknown): void {
     const event: SessionEvent = { type, seq: this.seq++, time: Date.now(), data }
+    this.logged.push({ sessionId: this.record.createOptions?.sessionId ?? 'fake-session', event })
     for (const listener of this.listeners.get('session/event') ?? []) {
       listener({ id: this.record.createOptions?.sessionId ?? 'fake-session' }, event)
     }
+  }
+
+  /** Every event this kernel published (the durable log a resume replays). */
+  private readonly logged: Array<{ readonly sessionId: string; readonly event: SessionEvent }> = []
+  /** Sessions whose "persisted" history a resume must load. */
+  private readonly durable = new Map<string, readonly SessionEvent[]>()
+
+  /** The durable log of one session — what `session.snapshotEvents()` returns. */
+  loggedEvents(sessionId: string): readonly SessionEvent[] {
+    return [
+      ...(this.durable.get(sessionId) ?? []),
+      ...this.logged.filter((entry) => entry.sessionId === sessionId).map((entry) => entry.event),
+    ]
+  }
+
+  /**
+   * Publish one live model-stream frame (dsh ≥ 0.1.5): the Agent-scoped
+   * `agent/assistant-stream` event, NOT a session event. The transcript is
+   * built from these while the turn runs; the durable `assistant/message`
+   * then settles it.
+   */
+  emitStreamFrame(sessionId: string, frame: Record<string, unknown>): void {
+    const listener = this.record.streamListener
+    if (!listener) return
+    listener({ agent: { id: sessionId }, frame })
   }
 
   private readonly agentsService: KernelAgentsService = {
@@ -453,6 +484,7 @@ class FakeKernel implements KernelContext {
       const session: Session = {
         id: options.sessionId,
         events: [],
+        snapshotEvents: (): readonly SessionEvent[] => kernel.loggedEvents(options.sessionId),
         append(type, data): SessionEvent {
           return { type, seq: kernel.seq++, time: Date.now(), data }
         },
@@ -466,6 +498,7 @@ class FakeKernel implements KernelContext {
           on(name: string, listener: (...args: unknown[]) => unknown): () => void {
             if (name === 'agent/request') kernel.record.requestListener = listener
             if (name === 'approval/request') kernel.record.approvalListener = listener
+            if (name === 'agent/assistant-stream') kernel.record.streamListener = listener
             return () => {}
           },
         },
@@ -498,6 +531,11 @@ class FakeKernel implements KernelContext {
         throw new Error(`session not found: ${options.resumeSessionId}`)
       }
       this.record.resumedId = options.resumeSessionId
+      // The real resume loads the stored log into the reconstructed session;
+      // keep the fake's seq counter ahead of the replayed prefix.
+      const history = durableHistory()
+      this.durable.set(options.resumeSessionId, history)
+      this.seq = Math.max(this.seq, history.length)
       return this.agentsService.create({ sessionId: options.resumeSessionId, agentOptions: options.agentOptions })
     },
     get: (id: string) => this.liveAgents.get(id) as AgentHandle['agent'] | undefined,
@@ -505,25 +543,36 @@ class FakeKernel implements KernelContext {
   }
 
   /**
-   * A scripted turn streamed the way the kernel would: the real envelope
-   * (`{type, seq, time, data}`) — `request/header` route snapshot,
-   * `assistant/chunk` text/reasoning deltas, tool lifecycle, and an
-   * `assistant/message` carrying `usage`.
+   * A scripted turn streamed the way the kernel does since dsh 0.1.5: the
+   * durable session envelope (`{type, seq, time, data}`) carries
+   * `request/header`, the tool lifecycle and the settling `assistant/message`
+   * (with its embedded stream), while the LIVE deltas arrive as
+   * `agent/assistant-stream` frames — `assistant/chunk` is no longer a
+   * session event at all.
    */
   private streamTurn(message: UserMessage): void {
     const turn = 1
     const step = 1
+    const sessionId = this.record.createOptions?.sessionId ?? 'fake-session'
+    const attemptId = 'attempt-1'
     const at = (delay: number, type: string, data: unknown): void => {
       setTimeout(() => this.emit(type, data), delay)
     }
+    const frameAt = (delay: number, frame: Record<string, unknown>): void => {
+      setTimeout(() => this.emitStreamFrame(sessionId, frame), delay)
+    }
+    const text = '**你好**，Orca。\n\n- 列表一\n- 列表二\n\n```ts\nconst n = 1 // 注释\n```\n\n流式增量上屏测试。'
+    const reasoning = '思考一下。'
     at(0, 'turn/start', { turn })
+    at(5, 'step/start', { turn, step })
     at(10, 'user/message', message)
     at(20, 'request/header', {
       header: { config: { provider: 'default-provider', model: 'default-model' } },
       reason: 'initial',
     })
-    at(40, 'assistant/chunk', { turn, step, chunk: { type: 'text-delta', index: 0, text: '**你好**，Orca。\n\n- 列表一\n- 列表二\n\n```ts\nconst n = 1 // 注释\n```\n\n流式增量上屏测试。' } })
-    at(150, 'assistant/chunk', { turn, step, chunk: { type: 'reasoning-delta', index: 1, text: '思考一下。' } })
+    frameAt(30, { type: 'start', attemptId, revision: 1, turn, step })
+    frameAt(40, { type: 'chunk', attemptId, revision: 1, index: 0, time: Date.now(), chunk: { type: 'text-delta', index: 0, text } })
+    frameAt(150, { type: 'chunk', attemptId, revision: 1, index: 1, time: Date.now(), chunk: { type: 'reasoning-delta', index: 1, text: reasoning } })
     at(200, 'tool/call', { turn, step, callId: 'call-1', name: 'edit', arguments: '{"path":"src/app.ts"}' })
     at(260, 'tool/result', {
       turn,
@@ -542,12 +591,23 @@ class FakeKernel implements KernelContext {
       message: {
         id: 'msg-assistant-1',
         role: 'assistant',
-        content: [{ type: 'text', text: '**你好**，Orca。\n\n- 列表一\n- 列表二\n\n```ts\nconst n = 1 // 注释\n```\n\n流式增量上屏测试。' }],
+        // The durable message carries BOTH blocks: reasoning first, then the
+        // answer. A replay projects this; the live path must not duplicate it.
+        content: [
+          { type: 'reasoning', text: reasoning },
+          { type: 'text', text },
+        ],
         source: { kind: 'model', provider: 'default-provider', model: 'default-model' },
       },
+      stream: [
+        { type: 'reasoning-chunks', time0: Date.now(), index: 0, dt: [0], texts: [reasoning] },
+        { type: 'text-chunks', time0: Date.now(), index: 1, dt: [0], texts: [text] },
+      ],
       usage: { inputTokens: 120, outputTokens: 45, reasoningTokens: 30, cacheReadTokens: 60, cacheWriteTokens: 15 },
     })
+    at(590, 'step/end', { turn, step })
     at(600, 'turn/end', { turn, reason: { kind: 'completed' } })
+    frameAt(600, { type: 'end', attemptId, revision: 1, index: 2, outcome: { kind: 'committed', eventType: 'assistant/message', seq: 3 } })
   }
 }
 
@@ -743,22 +803,99 @@ async function main(): Promise<void> {
   // (and on reasoning `block-end`) — the spinner must not run under the
   // streaming answer ───────────────────────────────────────────────────────
   {
-    // Delta-only protocol: no block-end, first text-delta seals the thought.
+    // The live path (dsh ≥ 0.1.5): deltas arrive as `agent/assistant-stream`
+    // chunk frames, never as session events.
     const ch = new Channel()
     ch.ingest({ type: 'turn/start', seq: 0, time: Date.now(), data: { turn: 1 } } as never)
-    ch.ingest({ type: 'assistant/chunk', seq: 1, time: Date.now(), data: { chunk: { type: 'reasoning-delta', index: 0, text: '想一下' } } } as never)
+    ch.beginAttempt()
+    ch.ingestStreamChunk({ type: 'reasoning-delta', index: 0, text: '想一下' })
     const open = ch.rows.find((row) => row.kind === 'thought')
     if (!open || open.seconds !== undefined) problems.push('phase0.86：思考行应该先保持展开流式')
-    ch.ingest({ type: 'assistant/chunk', seq: 2, time: Date.now(), data: { chunk: { type: 'text-delta', index: 0, text: '正文开始' } } } as never)
+    ch.ingestStreamChunk({ type: 'text-delta', index: 0, text: '正文开始' })
     const sealed = ch.rows.find((row) => row.kind === 'thought')
     if (!sealed || sealed.seconds === undefined) problems.push('phase0.86：正文开始后思考行未折叠为已思考')
     // Block-framed protocol: reasoning block-end seals even before any text.
     const ch2 = new Channel()
     ch2.ingest({ type: 'turn/start', seq: 0, time: Date.now(), data: { turn: 1 } } as never)
-    ch2.ingest({ type: 'assistant/chunk', seq: 1, time: Date.now(), data: { chunk: { type: 'reasoning-delta', index: 0, text: '想一下' } } } as never)
-    ch2.ingest({ type: 'assistant/chunk', seq: 2, time: Date.now(), data: { chunk: { type: 'block-end', index: 0, block: { type: 'reasoning', text: '想一下' } } } } as never)
+    ch2.beginAttempt()
+    ch2.ingestStreamChunk({ type: 'reasoning-delta', index: 0, text: '想一下' })
+    ch2.ingestStreamChunk({ type: 'block-end', index: 0, block: { type: 'reasoning', text: '想一下' } })
     const sealed2 = ch2.rows.find((row) => row.kind === 'thought')
     if (!sealed2 || sealed2.seconds === undefined) problems.push('phase0.86：reasoning block-end 未折叠思考行')
+    // The legacy in-log chunk shape stays supported (older persisted logs).
+    const ch3 = new Channel()
+    ch3.ingest({ type: 'turn/start', seq: 0, time: Date.now(), data: { turn: 1 } } as never)
+    ch3.ingest({ type: 'assistant/chunk', seq: 1, time: Date.now(), data: { chunk: { type: 'text-delta', index: 0, text: '旧日志' } } } as never)
+    if (!ch3.rows.some((row) => row.kind === 'assistant' && row.text === '旧日志')) {
+      problems.push('phase0.86：旧版 assistant/chunk 日志未投影')
+    }
+  }
+
+  // ── Phase 0.87: replay (dsh ≥ 0.1.5) — the log has NO chunks, so the
+  // durable `assistant/message` content is the only text source; a live turn
+  // that already streamed must not double-project it ────────────────────────
+  {
+    const message = {
+      id: 'msg-1',
+      role: 'assistant',
+      content: [
+        { type: 'reasoning', text: '先想' },
+        { type: 'text', text: '答复正文' },
+      ],
+      source: { kind: 'model' },
+    }
+    const log = [
+      { type: 'turn/start', seq: 0, time: Date.now(), data: { turn: 1 } },
+      { type: 'user/message', seq: 1, time: Date.now(), data: { content: [{ type: 'text', text: '问' }], source: { kind: 'user' } } },
+      { type: 'step/start', seq: 2, time: Date.now(), data: { turn: 1, step: 1 } },
+      { type: 'assistant/message', seq: 3, time: Date.now(), data: { turn: 1, step: 1, message, stream: [] } },
+      { type: 'step/end', seq: 4, time: Date.now(), data: { turn: 1, step: 1 } },
+      { type: 'turn/end', seq: 5, time: Date.now(), data: { turn: 1, reason: { kind: 'completed' } } },
+    ]
+    const ch = new Channel()
+    ch.replay(log as never)
+    const answer = ch.rows.filter((row) => row.kind === 'assistant')
+    const thought = ch.rows.filter((row) => row.kind === 'thought')
+    if (answer.length !== 1 || answer[0]?.text !== '答复正文') {
+      problems.push(`phase0.87：replay 未从 assistant/message 投影正文：${JSON.stringify(ch.rows.map((r) => [r.kind, r.text]))}`)
+    }
+    if (thought.length !== 1 || thought[0]?.seconds === undefined) {
+      problems.push('phase0.87：replay 未投影（并折叠）思考行')
+    }
+    // Same log, but live: deltas first, then the settling event.
+    const live = new Channel()
+    for (const event of log.slice(0, 3)) live.ingest(event as never)
+    live.beginAttempt()
+    live.ingestStreamChunk({ type: 'reasoning-delta', index: 0, text: '先想' })
+    live.ingestStreamChunk({ type: 'text-delta', index: 1, text: '答复正文' })
+    live.ingest(log[3] as never)
+    const liveAnswer = live.rows.filter((row) => row.kind === 'assistant')
+    const liveThought = live.rows.filter((row) => row.kind === 'thought')
+    if (liveAnswer.length !== 1 || liveAnswer[0]?.text !== '答复正文') {
+      problems.push(`phase0.87：live 流式正文被重复/篡改：${JSON.stringify(live.rows.map((r) => [r.kind, r.text]))}`)
+    }
+    if (liveThought.length !== 1) {
+      problems.push(`phase0.87：live 思考行重复：${String(liveThought.length)}`)
+    }
+    // File blocks (new in 0.1.5) must label the row instead of degrading to a
+    // bare `…` — and co-exist with image labels.
+    const chFiles = new Channel()
+    chFiles.ingest({
+      type: 'user/message',
+      seq: 0,
+      time: Date.now(),
+      data: {
+        content: [
+          { type: 'image', attachment: { attachmentId: 'i1', mediaType: 'image/png', bytes: 1, width: 1, height: 1 } },
+          { type: 'file', attachment: { attachmentId: 'f1', name: 'a.pdf', bytes: 3 } },
+        ],
+        source: { kind: 'user' },
+      },
+    } as never)
+    const userRow = chFiles.rows.find((row) => row.kind === 'user')
+    if (userRow?.text !== '[image #1] [file #1]') {
+      problems.push(`phase0.87：附件标签渲染异常：「${userRow?.text ?? '(无行)'}」`)
+    }
   }
 
   // ── Phase 1: degraded boot (#183) — no `agents` service, never a throw ───

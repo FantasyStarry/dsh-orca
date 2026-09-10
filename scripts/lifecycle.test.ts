@@ -153,7 +153,7 @@ test('rapid new-session requests release superseded creation before adopting the
     assert.equal(pendingOptions?.signal?.aborted, true)
     const abandoned = pendingOptions!.sessionId
     creation.resolve(h.handle(abandoned, [], async () => { disposedIds.push(abandoned) }))
-    await until(() => calls === 3 && h.state.attached === 6)
+    await until(() => calls === 3 && h.state.attached === 8) // 2 adopted agents × 4 agent-scoped listeners
     assert.equal(disposedIds.length, 2)
     assert.ok(disposedIds.includes(abandoned))
     h.input.text('hello\r')

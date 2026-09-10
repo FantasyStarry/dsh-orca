@@ -13,9 +13,9 @@
 1. **零内核改动**：不 fork 内核、不加私有方法、不碰 `_meta`。一切经由 in-process Cordis 接缝（`agents`、`session/event`、`ctx.get(name, false)` 软探测）。
 2. **插件契约三面**：`name` / `Config` / `apply`，无默认导出；所有配置键必须有默认值，插件缺失 = 什么都没发生，绝不让启动失败。
 3. **#183 纪律**：代码级 inject 为空；可选接缝全部软探测 + 静默降级（见 `src/app.ts` 的 `agents` 处理范例）。
-4. **Session 是真源**：UI 不持有会话真相；一切投影可从 `session/event` 重建（见 `src/adapter/channel.ts`）。
+4. **Session 是真源**：UI 不持有会话真相；一切投影可从 `session/event` 重建（见 `src/adapter/channel.ts`）。注意 0.1.5 起日志里**没有 chunk 事件**：实时增量走 agent 作用域的 `agent/assistant-stream`，回放靠 `assistant/message` 的 message.content / stream。
 5. **TUI 活动期间 stdout 安静**：诊断走 stderr（`ORCA_DEBUG=1`），绝不 `console.log` 到 stdout。
-6. **事件注册两铁律**（落地时）：log-only + 写入每个可达 dsh-session 副本的 `KNOWN_SESSION_EVENT_TYPES`。
+6. **自造事件**:本插件当前不 append 任何 session 事件；若将来要落地，事件必须是 log-only 且带 `ignorable: true`（0.1.5 内核已废弃“事件名注册到 `KNOWN_SESSION_EVENT_TYPES`”的做法，改用事件自带的 `ignorable` 标记声明“跳过是否安全”）。
 7. **清理挂 `ctx.effect`**：每个 disposer 都要能在插件卸载时恢复终端/释放句柄。
 
 ## 工程约定
@@ -41,8 +41,8 @@ pnpm dev   # 假内核冒烟：TTTY 渲染循环、键盘、降级启动
 | 路径 | 职责 |
 | --- | --- |
 | `src/index.ts` | 插件契约（保持轻量，延迟加载 runtime） |
-| `src/app.ts` | 装配：TTY 门 → agent 工厂 → channel/renderer/keyboard → 统一 disposer |
-| `src/adapter/channel.ts` | session/event → 转录行投影 + 行级连续封存；submit/steer/cancel 动作入口 |
+| `src/app.ts` | 装配：TTY 门 → agent 工厂 → channel/renderer/keyboard → 统一 disposer；agent 作用域监听（`agent/request`、`agent/assistant-stream`、`approval/request`、`user-questions/request`） |
+| `src/adapter/channel.ts` | session/event + `agent/assistant-stream` → 转录行投影 + 行级连续封存；submit/steer/cancel 动作入口 |
 | `src/tui/renderer.ts` | 流式追加渲染 + CUP 绝对寻址 + CSI 2026；封存行自然滚入 scrollback，帧输出唯一出口 |
 | `src/tui/chat.ts` | 纯函数帧构建（channel + editor + width → lines） |
 | `src/tui/input.ts` | raw 模式键盘解析 |
