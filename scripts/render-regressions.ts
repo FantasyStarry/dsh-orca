@@ -78,8 +78,36 @@ assert.equal(cursorFrame.cursor.col, 10)
 const cursorRow = cursorFrame.live.length - 1 - cursorFrame.cursor.fromEnd
 assert.match(visible([cursorFrame.live[cursorRow] ?? '']), /> he/)
 
+// A long line SOFT-WRAPS inside the editor box instead of being truncated at
+// the frame edge, and the caret stays inside the box.
 const narrowCursor = buildFrame(context(cursorChannel, { editorText: 'x'.repeat(200), width: 20 }))
-assert.equal(narrowCursor.cursor.col, 19)
+assert.equal(narrowCursor.cursor.col, 9) // 200 = 14×14 + 4 → caret after 4 cells
+assert.match(visible([narrowCursor.live[narrowCursor.live.length - 1 - narrowCursor.cursor.fromEnd] ?? '']), /│ {3}xxxx/)
+
+// Multi-line editor: a newline splits the box, the box grows by one row per
+// line, and the caret parks inside the box (reverse video carries the real
+// cursor position — see inputBox).
+const multiFrame = buildFrame(context(cursorChannel, {
+  editorText: 'alpha\nbravo',
+  editorCursor: 8, // inside "bravo"
+  fullscreen: false,
+}))
+const multiVisible = visible(multiFrame.live).split('\n').map((line) => line.replace(/\s+$/, ''))
+const firstLine = multiVisible.findIndex((line) => line.includes('> alpha'))
+assert.ok(firstLine > 0, '第一条编辑行应在框内')
+assert.ok(multiVisible[firstLine + 1]?.includes('bravo'), '第二条编辑行紧随其后')
+const caretLine = multiFrame.live.length - 1 - multiFrame.cursor.fromEnd
+assert.equal(caretLine, firstLine + 1, '光标行应落在最后一条编辑行')
+assert.ok(multiFrame.cursor.col >= 5 && multiFrame.cursor.col <= 19, `caret col=${multiFrame.cursor.col} 应落在框内`)
+
+// The window caps the box height and says how much is hidden.
+const tallFrame = buildFrame(context(cursorChannel, {
+  editorText: Array.from({ length: 20 }, (_, i) => `line${i}`).join('\n'),
+  fullscreen: false,
+}))
+const tallVisible = visible(tallFrame.live)
+assert.match(tallVisible, /↑ \d+ 行/, '折叠时应在底边提示上方还有多少行')
+assert.ok(tallVisible.split('\n').length <= 24)
 
 // The open row changes in place without touching seq. The next frame must
 // invalidate that row while reusing the immutable prefix.

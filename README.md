@@ -20,6 +20,7 @@ orca / dsh-orca   # 均等价于 dsh --profile orca
 - `/preset` 切换 Agent 预设
 - 附件输入：`/img`（`/attach`）附加本地文件——图片走 `image` 块、其他文件走 `file` 块；`Ctrl+V` / `Alt+V` 粘贴图片，输入框内联 `[image #N]` / `[file #N]`，支持删除
 - `@` 文件补全
+- 多行输入：`Alt+Enter`（`Shift+Enter` / `Ctrl+J` 同义）换行，长行按 cell 软换行，编辑框随内容长高（上限 8 行，超出时底边提示 `↑/↓ N 行`）；`↑`/`↓` 在文本内移动光标，只在首/末行才召回历史；`Home/End`/`Ctrl+A`/`Ctrl+E`/`Ctrl+U`/`Ctrl+K` 都是行内语义
 - 待办列表：`/todo`
 - 内核命令自动并入 `/` 菜单（真实 profile 里的 `/goal`、`/feedback` 等），并跟随 `commands/change` 实时刷新
 - Agent 提问：支持官方 `ctx.userQuestions`，picker 单选/多选/自定义回答
@@ -110,14 +111,15 @@ dsh-orca
 | 快捷键 | 说明 |
 | --- | --- |
 | `Enter` | 发送 |
+| `Alt+Enter` | 换行（`Shift+Enter` / `Ctrl+J` 同义；多行输入） |
 | `Ctrl+V` / `Alt+V` | 粘贴剪贴板图片 |
 | `@路径` | 文件补全 |
-| `↑` / `↓` | 历史召回 / 返回 |
+| `↑` / `↓` | 多行文本内移动光标；在首/末行时才召回历史 |
 | `Shift+Tab` | 切换 yolo |
 | `Ctrl+O` | 展开/折叠思考过程 |
 | `Esc` | 打断 / 取消 |
 | `Ctrl+C` | 打断 / 双击退出 |
-| `Ctrl+A/E/K/U/W` | readline 编辑 |
+| `Ctrl+A/E/K/U/W` | readline 编辑（行内语义：Home/End、删到本行首/尾、删词） |
 
 ## 环境变量
 
@@ -175,7 +177,6 @@ dsh --profile orca
 
 - 全屏模式下的鼠标选择与复制（OSC 52）
 - 跨平台剪贴板图片粘贴（当前仅 Windows）
-- 输入框多行编辑
 - 鼠标滚轮滚动全屏视图
 
 ## 项目结构

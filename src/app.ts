@@ -85,6 +85,9 @@ export interface AppIoDeps {
 const FACTORY_RETRY_ATTEMPTS = 50
 const FACTORY_RETRY_DELAY_MS = 100
 
+/** Paste cap: beyond this the editor would stall the frame builder, so truncate. */
+const PASTE_MAX_CHARS = 20_000
+
 function sleep(ms: number): Promise<void> {
   return new Promise<void>((resolve) => setTimeout(resolve, ms))
 }
@@ -604,7 +607,7 @@ export function bootstrapApp(
     for (const [group, lines] of groups) {
       channel.pushSystem(`【${group}】${lines.join(' · ')}`)
     }
-    channel.pushSystem('快捷键：@ 文件补全（Tab/Enter 确认）· Ctrl+V/Alt+V 附加剪贴板图片 · ↑ 召回上一条 · Shift+Tab 切换 yolo · Ctrl+O 展开思考 · Ctrl+C 打断/双击退出 · 双击 Esc 回退上一轮 · 未知 /命令将作为普通消息发给模型')
+    channel.pushSystem('快捷键：@ 文件补全（Tab/Enter 确认）· Alt+Enter/Shift+Enter/Ctrl+J 换行 · ↑↓ 在多行里移动光标（到首/末行才召回历史）· Ctrl+V/Alt+V 附加剪贴板图片 · Shift+Tab 切换 yolo · Ctrl+O 展开思考 · Ctrl+C 打断/双击退出 · 双击 Esc 回退上一轮 · 未知 /命令将作为普通消息发给模型')
   }
 
   const showUsage = (): void => {
@@ -2076,6 +2079,12 @@ export function bootstrapApp(
   /** Logical editor cursor — a code-point offset into `editor` (left/right/
    *  Home/End/editing chords; the render highlights the char under it). */
   let cursorPos = 0
+  /**
+   * Sticky column for vertical motion in the multi-line editor: ↑/↓ keep the
+   * column they started from, so crossing a short line does not drag the
+   * cursor left. Any horizontal move or edit clears it.
+   */
+  let preferredColumn: number | null = null
   let lastEscAt = 0
   /** Double-Ctrl+C exit window (mainstream shell behavior): the first press
    *  interrupts the running turn or clears the editor, the second exits. */
@@ -2203,15 +2212,27 @@ export function bootstrapApp(
     return { text: text.trim(), images, files }
   }
 
-  /** Insert text at the cursor; folded pasted newlines stay single-line. */
+  /** Insert text at the cursor; CRLF folds to LF, real newlines are KEPT. */
   const insertText = (seq: string): void => {
-    const clean = seq.replace(/\r\n?/g, ' ').replace(/[\uE000\uE001]/g, '')
+    const clean = seq.replace(/\r\n?/g, '\n').replace(/[\uE000\uE001]/g, '')
     if (clean === '') return
     const chars = Array.from(editor)
     const ins = Array.from(clean)
     chars.splice(cursorPos, 0, ...ins)
     editor = chars.join('')
     cursorPos += ins.length
+    preferredColumn = null
+    menuIndex = 0
+    scheduleAtFetch()
+  }
+
+  /** Insert a hard line break (Alt+Enter / Shift+Enter / Ctrl+J). */
+  const insertNewline = (): void => {
+    const chars = Array.from(editor)
+    chars.splice(cursorPos, 0, '\n')
+    editor = chars.join('')
+    cursorPos += 1
+    preferredColumn = null
     menuIndex = 0
     scheduleAtFetch()
   }
@@ -2227,6 +2248,7 @@ export function bootstrapApp(
     removePendingAttachmentsInRange(chars, from, cursorPos)
     editor = [...chars.slice(0, from), ...chars.slice(cursorPos)].join('')
     cursorPos = from
+    preferredColumn = null
     scheduleAtFetch()
   }
 
@@ -2235,32 +2257,76 @@ export function bootstrapApp(
     if (cursorPos >= chars.length) return
     removePendingAttachmentsInRange(chars, cursorPos, cursorPos + 1)
     editor = [...chars.slice(0, cursorPos), ...chars.slice(cursorPos + 1)].join('')
+    preferredColumn = null
     scheduleAtFetch()
   }
 
+  /** `[start, end)` of the logical line containing `pos` (newline excluded). */
+  const lineBounds = (pos: number): { readonly start: number; readonly end: number } => {
+    const chars = Array.from(editor)
+    const at = Math.max(0, Math.min(chars.length, pos))
+    let start = at
+    while (start > 0 && (chars[start - 1] ?? '') !== '\n') start--
+    let end = at
+    while (end < chars.length && (chars[end] ?? '') !== '\n') end++
+    return { start, end }
+  }
+
+  /** Ctrl+U — kill from the cursor back to the start of the CURRENT line. */
   const killToStart = (): void => {
+    const { start } = lineBounds(cursorPos)
     const chars = Array.from(editor)
-    removePendingAttachmentsInRange(chars, 0, cursorPos)
-    editor = chars.slice(cursorPos).join('')
-    cursorPos = 0
+    removePendingAttachmentsInRange(chars, start, cursorPos)
+    editor = [...chars.slice(0, start), ...chars.slice(cursorPos)].join('')
+    cursorPos = start
+    preferredColumn = null
     scheduleAtFetch()
   }
 
+  /** Ctrl+K — kill from the cursor to the end of the CURRENT line. */
   const killToEnd = (): void => {
+    const { end } = lineBounds(cursorPos)
     const chars = Array.from(editor)
-    removePendingAttachmentsInRange(chars, cursorPos, chars.length)
-    editor = chars.slice(0, cursorPos).join('')
+    removePendingAttachmentsInRange(chars, cursorPos, end)
+    editor = [...chars.slice(0, cursorPos), ...chars.slice(end)].join('')
+    preferredColumn = null
     scheduleAtFetch()
   }
 
   const moveCursor = (delta: number): void => {
     cursorPos = Math.max(0, Math.min(codeLen(editor), cursorPos + delta))
+    preferredColumn = null
     scheduleAtFetch()
   }
 
   const moveTo = (pos: number): void => {
     cursorPos = Math.max(0, Math.min(codeLen(editor), pos))
+    preferredColumn = null
     scheduleAtFetch()
+  }
+
+  /**
+   * Vertical cursor motion inside a multi-line editor, keeping the preferred
+   * visual column (sticky like every real editor: a short line does not pull
+   * the column back). Returns false when there is no line in that direction —
+   * the caller then treats Up/Down as history recall, which is exactly the
+   * single-line behavior.
+   */
+  const moveVertical = (delta: number): boolean => {
+    const { start, end } = lineBounds(cursorPos)
+    const column = preferredColumn ?? (cursorPos - start)
+    if (delta < 0) {
+      if (start === 0) return false
+      const above = lineBounds(start - 1)
+      cursorPos = Math.min(above.end, above.start + column)
+    } else {
+      if (end >= codeLen(editor)) return false
+      const below = lineBounds(end + 1)
+      cursorPos = Math.min(below.end, below.start + column)
+    }
+    preferredColumn = column
+    scheduleAtFetch()
+    return true
   }
 
   /** Move one word to the left (readline backward-word). */
@@ -2434,6 +2500,7 @@ export function bootstrapApp(
   const resetEditor = (): void => {
     editor = ''
     cursorPos = 0
+    preferredColumn = null
     menuIndex = 0
     atMenu = null
     historyIndex = null
@@ -2654,15 +2721,25 @@ export function bootstrapApp(
   }
 
   /**
-   * Bracketed paste (200~ … 201~): one burst, newlines folded — a pasted
-   * image path attaches instead of landing in the prompt; terminals without
-   * the mode fall back to the submit-path detection below.
+   * Bracketed paste (200~ … 201~): one burst. A pasted image path attaches
+   * instead of landing in the prompt; anything else keeps its line structure
+   * (the editor is multi-line now), minus the trailing newline every copy
+   * tends to carry. Terminals without the mode fall back to the submit-path
+   * detection below.
    */
   function handlePaste(text: string): void {
-    const cleaned = text.replace(/\r\n?/g, ' ')
+    const cleaned = text.replace(/\r\n?/g, '\n').replace(/\n+$/, '')
     const trimmed = cleaned.trim()
     if (looksLikeImagePath(trimmed)) {
       void attachLocalPath(trimmed)
+      return
+    }
+    // A pathological paste (a whole file) must not wedge the editor or the
+    // frame builder; truncate with a visible notice instead of freezing.
+    const chars = Array.from(cleaned)
+    if (chars.length > PASTE_MAX_CHARS) {
+      insertText(chars.slice(0, PASTE_MAX_CHARS).join(''))
+      channel.pushSystem(`粘贴内容过长，已截断到 ${PASTE_MAX_CHARS} 字符`)
       return
     }
     insertText(cleaned)
@@ -2803,6 +2880,10 @@ export function bootstrapApp(
           insertText(key.sequence)
           break
         }
+        case 'newline': {
+          insertNewline()
+          break
+        }
         case 'navigate': {
           if (key.name === 'up' || key.name === 'down') {
             const atState = currentAtMenu()
@@ -2813,6 +2894,8 @@ export function bootstrapApp(
             } else if (menu && menu.items.length > 1) {
               const delta = key.name === 'down' ? 1 : -1
               menuIndex = (menu.index + delta + menu.items.length) % menu.items.length
+            } else if (moveVertical(key.name === 'down' ? 1 : -1)) {
+              // Moved a line inside the multi-line editor — history stays put.
             } else if (key.name === 'up') {
               historyRecall(-1)
             } else if (historyIndex !== null) {
@@ -2827,9 +2910,9 @@ export function bootstrapApp(
             if (key.ctrl) wordRight()
             else moveCursor(1)
           } else if (key.name === 'home') {
-            moveTo(0)
+            moveTo(lineBounds(cursorPos).start)
           } else if (key.name === 'end') {
-            moveTo(codeLen(editor))
+            moveTo(lineBounds(cursorPos).end)
           } else if (key.name === 'delete') {
             deleteAt()
           }
@@ -2839,10 +2922,10 @@ export function bootstrapApp(
           if (!key.ctrl || key.alt) break
           switch (key.name) {
             case 'a':
-              moveTo(0)
+              moveTo(lineBounds(cursorPos).start)
               break
             case 'e':
-              moveTo(codeLen(editor))
+              moveTo(lineBounds(cursorPos).end)
               break
             case 'k':
               killToEnd()

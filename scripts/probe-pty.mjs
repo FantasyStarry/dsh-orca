@@ -900,6 +900,30 @@ try {
   await settle()
   assertInputBox('清空后', '')
 
+  // ── step 4.5: multi-line editor — Alt+Enter (ESC CR, what Windows Terminal
+  //    sends) must insert a break, not cancel-and-submit, and the grown box
+  //    must keep the footer pinned to the last row ──
+  proc.write('第一行')
+  await settle()
+  proc.write('\x1b\r')
+  await settle()
+  proc.write('第二行')
+  await settle()
+  {
+    const lines = []
+    for (let r = 0; r < ROWS; r++) lines.push(screen.text(r))
+    const head = lines.findIndex((row) => row.includes('第一行'))
+    if (head === -1 || !(lines[head + 1] ?? '').includes('第二行')) {
+      fail(`[多行输入] Alt+Enter 未把编辑框撑成两行\n${screen.plain()}`)
+    }
+    if (!(lines[ROWS - 1] ?? '').includes('Ctrl+C 退出')) {
+      fail(`[多行输入] 撑高后页脚未钉底：「${(lines[ROWS - 1] ?? '').slice(0, 60)}」\n${screen.plain()}`)
+    }
+  }
+  proc.write('\x1b') // clear editor
+  await settle()
+  assertInputBox('多行清空后', '')
+
   // ── step 5: reopen /model, abort mid-flow with Esc, editor must recover ──
   proc.write('/model\r')
   await waitMarker('选择 Provider 2', /选择 Provider/)

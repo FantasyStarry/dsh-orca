@@ -1266,7 +1266,7 @@ async function main(): Promise<void> {
   // (top → prompt → bottom) + footer L1 → L2, each exactly once.
   while (rows2.length > 0 && rows2[rows2.length - 1] === '') rows2.pop()
   const tail = rows2.slice(-5)
-  const hint = 'Enter 发送 · /model · @文件 · Ctrl+V/Alt+V 图片 · Ctrl+O 思考 · Esc 取消 · Ctrl+C 退出'
+  const hint = 'Enter 发送 · Alt+Enter 换行 · /model · @文件 · Ctrl+V 图片 · Esc 取消 · Ctrl+C 退出'
   if (tail.length !== 5) problems.push(`phase2：最终画面尾部不足 5 行：${JSON.stringify(rows2.slice(-7))}`)
   const promptRow = rows2.find((row) => row.includes('> 说点什么...'))
   if (promptRow === undefined) {
@@ -1656,6 +1656,33 @@ async function main(): Promise<void> {
       const block = kernel8.record.followupMessage?.content[0]
       if (block?.type !== 'text' || block.text !== 'abXcd') {
         problems.push(`phase8：光标插入位置错误：${JSON.stringify(kernel8.record.followupMessage ?? null)}`)
+      }
+    }
+    // Multi-line editor: Alt+Enter (ESC CR — what Windows Terminal sends)
+    // inserts a break instead of submitting, ↑ moves INSIDE the text instead
+    // of recalling history, and Enter submits the whole thing as ONE message
+    // whose text block really contains the newline.
+    for (const ch of '第一行') stdin8.text(ch)
+    stdin8.text('\x1b\r')
+    for (const ch of '第二行') stdin8.text(ch)
+    await sleep(120)
+    {
+      const rows = paintScreen(rw, 24)
+      const head = rows.findIndex((row) => row.includes('第一行'))
+      if (head === -1 || !rows[head + 1]?.includes('第二行')) {
+        problems.push(`phase8：Alt+Enter 未把编辑框撑成两行：${JSON.stringify(rows.slice(-8))}`)
+      }
+      if (rows.some((row) => row.includes('说点什么'))) problems.push('phase8：多行编辑时仍显示占位符')
+    }
+    stdin8.key('up')
+    await sleep(60)
+    stdin8.text('!')
+    stdin8.key('return')
+    await sleep(120)
+    {
+      const block = kernel8.record.followupMessage?.content[0]
+      if (block?.type !== 'text' || block.text !== '第一行!\n第二行') {
+        problems.push(`phase8：多行编辑/换行提交错误：${JSON.stringify(kernel8.record.followupMessage ?? null)}`)
       }
     }
     // @ completion: '@read' → menu → Tab → '@README.md' → Enter submits it.

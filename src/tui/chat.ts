@@ -133,7 +133,10 @@ function attachmentToken(ch: string, kindIndex: number): string | undefined {
   return undefined
 }
 
-const HINT = 'Enter 发送 · /model · @文件 · Ctrl+V/Alt+V 图片 · Ctrl+O 思考 · Esc 取消 · Ctrl+C 退出'
+// Footer affordances. Kept SHORT on purpose: the line is truncated from the
+// right when the usage counters share it, and `Ctrl+C 退出` must survive that
+// (a fullscreen footer without the exit chord reads as a hung app).
+const HINT = 'Enter 发送 · Alt+Enter 换行 · /model · @文件 · Ctrl+V 图片 · Esc 取消 · Ctrl+C 退出'
 
 /** Orca brand role bullet: `🐋` is 2 cells + 1 space, so both our cell math
  *  and real emoji rendering agree on 3 (same width as the old `✨` bullet). */
@@ -194,7 +197,11 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
   // written once and never tracked, so they keep the verbatim text.
   // Pre-rendered chrome rows (welcome card, route lines) span the FULL
   // width already and bypass the content gutter.
-  const editorBox = inputBox(ctx.editorText, width, ctx.editorCursor, ctx.attachments)
+  // Editor grows with the content but never eats the transcript: cap the
+  // body at 8 rows, fewer on a short terminal (chrome + one transcript row
+  // must survive), and the box windows internally past that.
+  const editorRows = Math.max(1, Math.min(8, height - 12))
+  const editorBox = inputBox(ctx.editorText, width, ctx.editorCursor, ctx.attachments, editorRows)
   const footer = footerLines(ctx, width)
   const bottom = [...editorBox.lines, ...footer]
   const layout = syncChannelLayout(ctx, width, inner, gutter)
@@ -704,44 +711,88 @@ function wrappedLines(text: string, width: number): string[] {
   return wrapWidth(text, width)
 }
 
+/** One printable cluster of the editor body plus its paint, when it has one. */
+interface EditorCell {
+  readonly text: string
+  readonly paint?: (text: string) => string
+}
+
+interface EditorLogicalLine {
+  readonly cells: EditorCell[]
+  /** Cell index the logical cursor sits on, or -1 when it is another line. */
+  readonly cursorCell: number
+}
+
 /**
- * Terminal cursor column inside the editor box. When the logical cursor sits
- * mid-text, the char under it is painted in reverse video (see `inputBox`)
- * and the terminal cursor parks at the end of the text — diff-painted rows
- * cannot trust mid-line cursor placement, but the visible highlight carries
- * the position.
+ * Expand the raw editor text into per-logical-line cells, tracking the cell
+ * the logical cursor sits on. Attachment sentinels expand to their
+ * `[image #N]` label; the cursor on a token marks the token's first cell and
+ * a cursor right after it marks the last cell — the single-line editor's
+ * semantics, preserved.
  */
-/**
- * Boxed editor, kimi-style: primary rounded frame, `> ` prompt at column 2.
-/**
- * Pending attachment tokens render as inline labels inside the input box;
- * a mid-text logical cursor highlights the char under it (reverse video).
- */
-function expandAttachmentTokens(text: string): string {
-  let out = ''
+function editorLines(text: string, cursor: number): EditorLogicalLine[] {
+  const chars = Array.from(text)
+  const index = Math.max(0, Math.min(chars.length, cursor))
+  const lines: EditorLogicalLine[] = []
+  let cells: EditorCell[] = []
+  let cursorCell = -1
   let images = 0
   let files = 0
-  for (const ch of Array.from(text)) {
+  const breakLine = (): void => {
+    lines.push({ cells, cursorCell })
+    cells = []
+    cursorCell = -1
+  }
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i] ?? ''
+    if (ch === '\n') {
+      if (i === index) cursorCell = cells.length
+      breakLine()
+      continue
+    }
     let label: string | undefined
     if (ch === IMAGE_SENTINEL) label = attachmentToken(ch, ++images)
     else if (ch === FILE_SENTINEL) label = attachmentToken(ch, ++files)
     if (label !== undefined) {
-      // Display-only trailing space keeps multiple tokens readable without
-      // putting a real space in the raw editor (so Backspace deletes the
-      // whole token atomically).
-      out += label
-    } else {
-      out += ch
+      const tokenChars = Array.from(label)
+      if (i === index) cursorCell = cells.length
+      else if (i + 1 === index) cursorCell = cells.length + Math.max(0, tokenChars.length - 1)
+      for (const tokenChar of tokenChars) cells.push({ text: tokenChar, paint: theme.primary })
+      continue
     }
+    if (i === index) cursorCell = cells.length
+    cells.push({ text: ch })
   }
-  return out
+  if (index === chars.length) cursorCell = cells.length
+  breakLine()
+  return lines
 }
 
+/** Cell width of `cells[0..upto)` — wide clusters are 2 cells, not 2 chars. */
+function cellsWidth(cells: readonly EditorCell[], upto: number): number {
+  let sum = 0
+  for (let i = 0; i < upto && i < cells.length; i++) sum += stringWidth((cells[i] as EditorCell).text)
+  return sum
+}
+
+/**
+ * Boxed editor, kimi-style: primary rounded frame, `> ` prompt at column 2.
+ *
+ * Multi-line: the text soft-wraps at EXACT cell boundaries (an editor must
+ * not collapse whitespace the way prose wrapping does), the box grows with
+ * the content up to `maxRows`, and a window keeps the cursor row visible with
+ * `↑/↓ N 行` hints on the bottom border. Pending attachment tokens render as
+ * inline labels; the logical cursor is drawn as reverse video on the cell
+ * under it, and the terminal caret parks at the end of the text — the same
+ * convention the single-line editor used, and the one the diff painter is
+ * tested against.
+ */
 function inputBox(
   text: string,
   width: number,
   cursor?: number,
   attachments?: readonly string[],
+  maxRows = 8,
 ): { lines: string[]; cursorLine: number; cursorCol: number } {
   const w = Math.max(20, width)
   const style: BoxStyle = { bg: (t) => t, border: theme.primary }
@@ -749,42 +800,73 @@ function inputBox(
   // Legacy separate attachment rows are kept for callers that still pass
   // `attachments`; Orca now embeds image tokens inline via IMAGE_SENTINEL.
   for (const label of attachments ?? []) rows.push(boxLine('🖼 ' + cleanLine(label), w, style))
-  const sourceChars = Array.from(text)
-  const sourceIndex = Math.max(0, Math.min(sourceChars.length, cursor ?? sourceChars.length))
-  const cleaned = cleanLine(expandAttachmentTokens(text))
-  // Build the visible line directly from raw chars: only real sentinel tokens
-  // are highlighted, so manually typed `[image #1]` text stays plain.
-  let body = ''
-  let displayIndex = 0
-  let imageNumber = 0
-  let fileNumber = 0
-  for (let i = 0; i < sourceChars.length; i++) {
-    const ch = sourceChars[i] ?? ''
-    let label: string | undefined
-    if (ch === IMAGE_SENTINEL) label = attachmentToken(ch, ++imageNumber)
-    else if (ch === FILE_SENTINEL) label = attachmentToken(ch, ++fileNumber)
-    if (label !== undefined) {
-      const tokenChars = Array.from(label)
-      let cursorDisplay = -1
-      if (sourceIndex === i) cursorDisplay = displayIndex
-      else if (sourceIndex === i + 1) cursorDisplay = displayIndex + tokenChars.length - 1
-      let tokenBody = ''
-      for (let j = 0; j < tokenChars.length; j++) {
-        const tokenChar = tokenChars[j] ?? ''
-        tokenBody += displayIndex + j === cursorDisplay ? theme.cursor(tokenChar) : tokenChar
-      }
-      body += theme.primary(tokenBody)
-      displayIndex += tokenChars.length
-      continue
-    }
-    body += sourceIndex === i ? theme.cursor(ch) : ch
-    displayIndex++
+  // Body budget: `│ ` + `> ` + body + ` ` + `│`.
+  const bodyWidth = Math.max(8, w - 6)
+  const logical = editorLines(text, cursor ?? Array.from(text).length)
+
+  interface DisplayRow {
+    readonly cells: EditorCell[]
+    /** Cell index of the cursor inside this row, or -1. */
+    readonly cursorCell: number
   }
-  if (body === '') body = theme.placeholder('说点什么...')
-  const cursorLine = rows.length
-  rows.push(boxLine('> ' + body, w, style))
-  rows.push(boxBottom(w, style))
-  const cursorCol = Math.min(w - 1, 5 + stringWidth(cleaned))
+  const display: DisplayRow[] = []
+  for (const line of logical) {
+    let cells: EditorCell[] = []
+    let used = 0
+    let cursorCell = -1
+    const flush = (): void => {
+      display.push({ cells, cursorCell })
+      cells = []
+      used = 0
+      cursorCell = -1
+    }
+    for (let i = 0; i < line.cells.length; i++) {
+      const cell = line.cells[i] as EditorCell
+      const cellWidth = stringWidth(cell.text)
+      if (used > 0 && used + cellWidth > bodyWidth) flush()
+      if (i === line.cursorCell) cursorCell = cells.length
+      cells.push(cell)
+      used += cellWidth
+    }
+    if (line.cursorCell >= line.cells.length) cursorCell = cells.length
+    flush()
+  }
+
+  // Keep the cursor row in view, one row of context above it when possible.
+  const total = display.length
+  const visible = Math.max(1, Math.min(Math.max(1, maxRows), total))
+  const cursorRow = display.findIndex((row) => row.cursorCell >= 0)
+  const anchor = cursorRow >= 0 ? cursorRow : total - 1
+  const start = total > visible ? Math.max(0, Math.min(anchor - 1, total - visible)) : 0
+  const shown = display.slice(start, start + visible)
+  const empty = text === ''
+
+  for (let i = 0; i < shown.length; i++) {
+    const row = shown[i] as DisplayRow
+    let body = ''
+    for (let ci = 0; ci < row.cells.length; ci++) {
+      const cell = row.cells[ci] as EditorCell
+      const painted = ci === row.cursorCell ? theme.cursor(cell.text) : cell.text
+      body += cell.paint ? cell.paint(painted) : painted
+    }
+    if (body === '' && empty && start + i === 0) body = theme.placeholder('说点什么...')
+    const marker = start + i === 0 ? '> ' : '  '
+    rows.push(boxLine(marker + body, w, style))
+  }
+
+  // Caret at the end of the text (or of the visible window when the cursor
+  // sits above it): the reverse-video cell carries the real position.
+  const last = shown[shown.length - 1]
+  const caretEnd = last === undefined ? 0 : cellsWidth(last.cells, last.cells.length)
+  const cursorLine = rows.length - 1
+  const cursorCol = Math.min(w - 1, 5 + caretEnd)
+  const above = start
+  const below = total - start - shown.length
+  const hint = [
+    above > 0 ? `↑ ${above} 行` : '',
+    below > 0 ? `↓ ${below} 行` : '',
+  ].filter((part) => part !== '').join(' · ')
+  rows.push(hint === '' ? boxBottom(w, style) : boxBottom(w, style, hint))
   return { lines: rows, cursorLine, cursorCol }
 }
 

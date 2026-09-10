@@ -58,6 +58,8 @@ const CSI_KEYS: Readonly<Record<string, string>> = {
 
 /** CSI-u form of Alt+V (`\x1b[118;3u`) / Alt+Shift+V (`\x1b[86;4u`). */
 const ALT_V_CSI_RE = /^\x1b\[(\d+);(\d+)(?::(\d+))?u$/
+/** CSI-u form of CR/LF with modifiers: `\x1b[13;3u` = Alt+Enter. */
+const CSI_NEWLINE_RE = /^\x1b\[(13|10);(\d+)(?::\d+)?u$/
 
 const SS3_KEYS: Readonly<Record<string, string>> = {
   A: 'up',
@@ -226,6 +228,15 @@ export class Keyboard {
       }
       const follower = this.pending[1] ?? ''
       if (follower === '[' || follower === 'O') return // partial sequence — wait for more
+      // Alt+Enter (ESC CR / ESC LF) is the multi-line editor's newline chord.
+      // It MUST be recognized here: the generic path below flushes the Esc
+      // first, so Alt+Enter would degrade into "cancel, then submit".
+      if ((follower === '\r' || follower === '\n') && this.pending.length >= 2) {
+        const seq = this.pending.slice(0, 2)
+        this.pending = this.pending.slice(2)
+        this.handler({ name: 'alt+enter', ctrl: false, alt: true, shift: false, sequence: seq })
+        continue
+      }
       // Only Alt+V is recognized as an alt-chord: Windows Terminal consumes
       // Ctrl+V for its own paste, so image paste needs this escape hatch.
       // All other ESC+char stays the old behavior (Esc first, then the char).
@@ -248,6 +259,22 @@ export class Keyboard {
     // 先还原成文本，否则 Kitty/Ghostty/WezTerm 下输入直接丢字。release 事件
     //（flag 2 的 `:3` 后缀）永远吞掉——按键松开不应再进一次编辑器。
     if (isKeyRelease(sequence)) return
+    // CSI-u newline chords (Kitty protocol): `\x1b[13;3u` Alt+Enter,
+    // `\x1b[13;2u` Shift+Enter, `\x1b[13;5u` Ctrl+Enter. CR/LF are not
+    // printable, so the printable decoder below drops them — they must be
+    // mapped here or the chord is silently swallowed.
+    const newlineCsi = CSI_NEWLINE_RE.exec(sequence)
+    if (newlineCsi) {
+      const modValue = Number(newlineCsi[2])
+      const bits = Number.isFinite(modValue) && modValue >= 2 ? modValue - 1 : 0
+      const shift = (bits & 1) !== 0
+      const alt = (bits & 2) !== 0
+      const ctrl = (bits & 4) !== 0
+      if (shift || alt || ctrl) {
+        this.handler({ name: alt ? 'alt+enter' : 'return', ctrl, alt, shift, sequence })
+        return
+      }
+    }
     // CSI-u Alt+V: Windows Terminal 不会把 Ctrl+V 交给 TUI，Alt+V 是图片粘贴
     // 的逃生口；这里把 `\x1b[118;3u` / `\x1b[86;4u` 还原成 `alt+v`。
     const altV = ALT_V_CSI_RE.exec(sequence)
@@ -299,10 +326,17 @@ function decodeChar(ch: string): KeyPress {
 }
 
 /** Submit / cancel / text-entry classification used by the editor. */
-export function classify(key: KeyPress): 'submit' | 'cancel' | 'exit' | 'backspace' | 'navigate' | 'text' | 'ignore' {
+export function classify(key: KeyPress): 'submit' | 'newline' | 'cancel' | 'exit' | 'backspace' | 'navigate' | 'text' | 'ignore' {
   if (key.ctrl && key.name === 'c') return 'exit'
   if (key.ctrl && key.name === 'd') return 'exit'
   if (key.name === 'escape') return 'cancel'
+  // Newline chords (the editor is multi-line). Alt+Enter is the one that works
+  // on every terminal: Windows Terminal and ConPTY send it as ESC CR, which
+  // `input.ts` decodes as the named `alt+enter`. Shift+Enter only arrives
+  // distinct under the Kitty protocol, and Ctrl+J is the legacy LF byte.
+  if (key.name === 'alt+enter') return 'newline'
+  if (key.name === 'return' && key.shift) return 'newline'
+  if (key.ctrl && key.name === 'j') return 'newline'
   if (key.name === 'return' && !key.ctrl && !key.alt) return 'submit'
   if (key.name === 'backspace') return 'backspace'
   // Navigation keys carry escape sequences as their `sequence`; inserting
