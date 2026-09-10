@@ -247,6 +247,28 @@ if (replayFile) {
 // Orca owns — if the app-level grid is correct, any conforming terminal
 // (including ConPTY with matching width tables) renders it correctly.
 const APP_LOG = probePath('probe-orca-app.log')
+
+// Every `/model` flow in this probe is a REAL pick: it appends a durable
+// `model/selection` to a throwaway probe session (fine) AND writes the
+// deployment default `agent-default-model` in `$DSH_HOME/settings.yaml` (NOT
+// fine — that is the user's remembered model for every new session, in every
+// front door). Snapshot the file once, up front, and restore it on every exit
+// path: a probe must never leave the user's model memory changed.
+const SETTINGS_FILE = `${DEFAULT_DSH_HOME}/settings.yaml`
+let SETTINGS_SNAPSHOT = null
+try {
+  SETTINGS_SNAPSHOT = readFileSync(SETTINGS_FILE)
+} catch {
+  // No settings document yet — nothing to restore (the pick would create one).
+}
+const restoreSettings = () => {
+  if (SETTINGS_SNAPSHOT === null) return
+  try {
+    writeFileSync(SETTINGS_FILE, SETTINGS_SNAPSHOT)
+  } catch {
+    // Best-effort: a read-only home must not mask the probe's real result.
+  }
+}
 try {
   writeFileSync(APP_LOG, '')
 } catch {}
@@ -325,6 +347,7 @@ proc.onExit(({ exitCode }) => {
 })
 
 const fail = (message) => {
+  restoreSettings()
   console.error(`probe 失败：${message}`)
   try {
     pollAppLog()
@@ -524,6 +547,7 @@ if (process.argv.includes('--fullscreen')) {
     try {
       proc.kill()
     } catch {}
+  restoreSettings()
     console.log('fullscreen probe 通过 ✔（页脚钉底 + 输入框完好贯穿模型切换）')
     process.exit(0)
   } catch (error) {
@@ -622,6 +646,7 @@ if (process.argv.includes('--features')) {
     try {
       proc.kill()
     } catch {}
+  restoreSettings()
     console.log('features probe 通过 ✔（文件附件通路 + 模型切换告知 + 附件跨命令存活）')
     process.exit(0)
   } catch (error) {
@@ -815,6 +840,7 @@ if (process.argv.includes('--state')) {
       writeFileSync(probePath('probe-last-raw.log'), raw)
     } catch {}
     writeFileSync(SETTINGS, settingsSnapshot)
+  restoreSettings()
     console.log('state probe 通过 ✔（工作区归属 + durable 模型记录 + 恢复沿用）')
     process.exit(0)
   } catch (error) {
@@ -873,6 +899,7 @@ if (process.argv.includes('--live')) {
     try {
       proc.kill()
     } catch {}
+  restoreSettings()
     console.log('live probe 通过 ✔（流式渲染 + 回合收尾 + 输入框完好）')
     process.exit(0)
   } catch (error) {
@@ -999,6 +1026,7 @@ try {
   try {
     proc.kill()
   } catch {}
+  restoreSettings()
   console.log('probe 通过 ✔（输入框在菜单/模型切换全流程后保持正确）')
   process.exit(0)
 } catch (error) {

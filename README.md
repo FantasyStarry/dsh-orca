@@ -162,7 +162,7 @@ node scripts/probe-pty.mjs --features  # 文件附件通路 + 模型切换告知
 node scripts/inspect-session.mjs <session-id>   # 会话日志取证（压缩帧感知）
 ```
 
-探针不写死任何本机路径：dsh 安装位置按 PATH 上的 `dsh` 定位（`ORCA_DSH_PKG` 可覆盖），产物落在 `.probe/`，工作目录取已登记工作区。CI（`.github/workflows/ci.yml`）在 ubuntu + windows 上跑 `build` / `test` / `dev`；PTY 探针需要真实内核与 node-pty，只在本地跑。
+探针不写死任何本机路径：dsh 安装位置按 PATH 上的 `dsh` 定位（`ORCA_DSH_PKG` 可覆盖），产物落在 `.probe/`，工作目录取已登记工作区。探针里的 `/model` 流程是**真实选择**（会写全局默认 `agent-default-model`），所以脚本启动时快照 `settings.yaml`，无论成功、失败还是超时都会**原样还原**——跑探针不会改掉你记住的模型。CI（`.github/workflows/ci.yml`）在 ubuntu + windows 上跑 `build` / `test` / `dev`；PTY 探针需要真实内核与 node-pty，只在本地跑。
 
 本地挂载：
 

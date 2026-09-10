@@ -41,7 +41,7 @@ pnpm test  # 生命周期 + 渲染回归 + 事件投影 + 选区几何/剪贴板
 
 涉及真实内核的改动，需在 profile 内实测：`dsh plugin --profile orca add .` → `dsh --profile orca`；能自动化的一律写进 `scripts/probe-pty.mjs`（真 ConPTY 驱动，`--state` 零 API 调用；`--features` / `--live` 各花一次最小调用），会话日志用 `scripts/inspect-session.mjs <session-id>` 取证。
 
-同一套命令在 CI（`.github/workflows/ci.yml`，ubuntu + windows 矩阵）上跑；PTY 探针依赖真实内核与 node-pty，不进 CI。**脚本里禁止写死本机路径**：dsh 安装、产物目录、工作目录一律走 `scripts/paths.mjs`（它会优先用 PATH 上那个 `dsh`，避免命中 `~/node_modules` 里可能陈旧的 hoisted 副本）。
+同一套命令在 CI（`.github/workflows/ci.yml`，ubuntu + windows 矩阵）上跑；PTY 探针依赖真实内核与 node-pty，不进 CI。**探针不得留下副作用**：`/model` 流程会写 `settings.yaml` 里的全局默认，脚本必须在任何退出路径（成功/失败/超时）把它还原成启动时的字节。**脚本里禁止写死本机路径**：dsh 安装、产物目录、工作目录一律走 `scripts/paths.mjs`（它会优先用 PATH 上那个 `dsh`，避免命中 `~/node_modules` 里可能陈旧的 hoisted 副本）。
 
 ## 目录地图
 

@@ -1622,7 +1622,16 @@ export function bootstrapApp(
     selection = next
     effortCleared = next.reasoningEffort === undefined
     const effort = next.reasoningEffort ? `(${next.reasoningEffort})` : ''
-    channel.pushSystem(`模型已切换：${next.provider}/${next.model}${effort} · 下一次请求生效`)
+    const defaultModel = getDefaultModel()
+    // Say what the pick AFFECTS: the live session immediately, and (when the
+    // service is mounted) the deployment default every new session starts on.
+    // Scope matters — the web's per-session pick does not touch the default,
+    // so a user who does not want it changed has to know this one does.
+    channel.pushSystem(
+      `模型已切换：${next.provider}/${next.model}${effort} · 下一次请求生效${
+        defaultModel ? ' · 已同步为新会话默认' : ''
+      }`,
+    )
     announceSelection(next)
     // Durable, log-only route intent: the SAME event the web host's
     // `session.selectModel` appends, so the choice lives in the session's own
@@ -1641,16 +1650,19 @@ export function bootstrapApp(
     } catch (error) {
       dbg(`model/selection 追加失败：${error instanceof Error ? error.message : String(error)}`)
     }
-    const defaultModel = getDefaultModel()
     if (defaultModel) {
       // Persist as the composition default, best-effort — the settings write
       // may reject OR throw synchronously (verified in-profile: a sync throw
       // rode the keypress handler and killed the process); neither may
-      // break the switch.
+      // break the switch. A failure is reported: the line above promised the
+      // default moved, and a silent no-op would be a lie.
       void Promise.resolve()
         .then(() => defaultModel.saveSelection({ ...next }))
         .then(() => dbg('saveSelection ok'))
-        .catch((error) => dbg(`saveSelection failed: ${error instanceof Error ? error.message : String(error)}`))
+        .catch((error) => {
+          dbg(`saveSelection failed: ${error instanceof Error ? error.message : String(error)}`)
+          channel.pushSystem('新会话默认写入失败：本次选型只对当前会话生效')
+        })
     }
   }
 
