@@ -8,10 +8,14 @@
  * Zero API cost: no prompt is ever submitted to the model.
  *
  * Usage: node scripts/probe-pty.mjs [--dump]   (exit 0 = pass, 1 = fail)
+ *        node scripts/probe-pty.mjs --features  (adds ONE minimal real prompt)
+ *        node scripts/probe-pty.mjs --state     (two boots: workspace accounting
+ *                                    + the session's remembered model; zero API cost)
  */
 
 import { createRequire } from 'node:module'
-import { writeFileSync, readFileSync } from 'node:fs'
+import { writeFileSync, readFileSync, readdirSync } from 'node:fs'
+import { DEFAULT_DSH_HOME, findSessionLog, readSessionEvents } from './session-log.mjs'
 
 const DSH_PKG = 'C:/Users/Mayn/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/package.json'
 const DSH_BIN = 'C:/Users/Mayn/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/lib/bin.js'
@@ -560,6 +564,202 @@ if (process.argv.includes('--features')) {
     console.log('features probe 通过 ✔（文件附件通路 + 模型切换告知 + 附件跨命令存活）')
     process.exit(0)
   } catch (error) {
+    fail(error instanceof Error ? error.message : String(error))
+  }
+}
+
+// ── state verification (--state): 工作区归属 + 会话记录的模型 ────────────────
+// Two real boots against the orca profile, zero API calls:
+//   A. a fresh session must be filed under the Workspace that owns this cwd
+//      (`workspace.json`) — host-side membership is the only way the web
+//      sidebar can group a TUI conversation instead of leaving it ungrouped —
+//      and a `/model` pick must land in the session LOG as the durable
+//      `model/selection` event the web host's `session.selectModel` appends;
+//   B. a second process resuming that session under a DECOY composition
+//      override (ORCA_PROVIDER/ORCA_MODEL) must still render the route the LOG
+//      records — proof the session's own record outranks the composition
+//      default instead of being re-asked every boot.
+// Phase A's pick rewrites `agent-default-model` in settings.yaml (standing
+// Orca behavior for a real pick, not a probe artifact): the file is
+// snapshotted up front and restored byte-exactly once both boots are gone.
+if (process.argv.includes('--state')) {
+  const SETTINGS = `${DEFAULT_DSH_HOME}/settings.yaml`
+  const WORKSPACES = `${DEFAULT_DSH_HOME}/storages/workspace.json`
+  const APP_LOG2 = 'C:/Users/Mayn/Desktop/dsh-orca/probe-orca-app2.log'
+  const settingsSnapshot = readFileSync(SETTINGS)
+  const stripAnsi = (text) => text.replace(/\x1b\[[0-9;?]*[@-~]/g, '').replace(/\x1b[\[\]][^\x07\x1b]*(\x07|\x1b\\)/g, '')
+  const routeOf = (selection) =>
+    `${selection.provider}/${selection.model}${selection.reasoningEffort ? `(${selection.reasoningEffort})` : ''}`
+  /** The `agent-default-model` block of settings.yaml (the pre-probe default). */
+  const defaultModelOf = (text) => {
+    const block = /^agent-default-model:\n((?:[ \t]+.*\n?)*)/m.exec(text)?.[1]
+    const provider = block && /provider:[ \t]*(\S+)/.exec(block)?.[1]
+    const model = block && /model:[ \t]*(\S+)/.exec(block)?.[1]
+    return provider && model ? { provider, model } : null
+  }
+  /** The workspace record owning the probe cwd, when the registry has one. */
+  const workspaceRecord = () => {
+    const data = JSON.parse(readFileSync(WORKSPACES, 'utf8'))
+    const wanted = CWD.replaceAll('/', '\\').toLowerCase()
+    return Object.values(data.tables.workspaces).find((record) => record.path.toLowerCase() === wanted)
+  }
+  const decoy = defaultModelOf(settingsSnapshot.toString('utf8'))
+  const globalTimer = setTimeout(() => fail(`全局超时 ${GLOBAL_TIMEOUT_MS}ms`), GLOBAL_TIMEOUT_MS)
+  let procB = null
+  try {
+    if (decoy === null) fail('settings.yaml 缺少 agent-default-model，构造不出诱饵路由')
+    await waitMarker('TUI 启动', /DeepSeek Harness 终端前端/)
+    await waitMarker('session 已连接', /session 已连接：session-[0-9a-f-]+/)
+    await settle()
+    const sessionId = /session 已连接：(session-[0-9a-f-]+)/.exec(screen.plainAll())?.[1]
+    if (!sessionId) fail(`未从屏幕读到会话 id\n${screen.plain()}`)
+
+    // 1) Workspace accounting — the attach is fire-and-forget after connect.
+    const deadline = Date.now() + 8000
+    let record = workspaceRecord()
+    while (!(record?.sessionIds ?? []).includes(sessionId) && Date.now() < deadline) {
+      await sleep(250)
+      record = workspaceRecord()
+    }
+    if (!record) {
+      fail(`当前 cwd 不是已登记工作区：${CWD}；注册表里有 ${JSON.stringify(Object.values(JSON.parse(readFileSync(WORKSPACES, 'utf8')).tables.workspaces).map((r) => r.path))}`)
+    }
+    if (!(record.sessionIds ?? []).includes(sessionId)) {
+      fail(`会话未登记到工作区 ${record.path}（${sessionId}）：${JSON.stringify(record.sessionIds.slice(0, 6))}`)
+    }
+    console.log(`工作区归属 ✔  ${record.path} ⊃ ${sessionId}`)
+
+    // 2) A /model pick must become a DURABLE record: the same event the web
+    //    host appends, in the session's own log. The pick must also DIFFER from
+    //    the composition default, or the resume check below could not tell the
+    //    two apart — so the picker flow is retried with a different cursor
+    //    movement until it lands somewhere else (`↓` in a single-model provider
+    //    or a single-effort model list cannot move at all).
+    const pickRoute = async (providerDown, modelDown, effortDown) => {
+      proc.write('/model')
+      await waitMarker('菜单补全提示', /切换模型/)
+      proc.write('\r')
+      await waitMarker('选择 Provider', /选择 Provider/)
+      await settle(300)
+      if (providerDown > 0) {
+        proc.write('\x1b[B'.repeat(providerDown))
+        await settle(250)
+      }
+      proc.write('\r')
+      await waitMarker('选择模型', /选择模型（/)
+      await settle(500)
+      if (modelDown > 0) {
+        proc.write('\x1b[B'.repeat(modelDown))
+        await settle(300)
+      }
+      proc.write('\r')
+      await waitMarker('选择思考强度', /选择思考强度（/)
+      await waitMarker('思考档位加载完成', /默认（模型默认行为）/)
+      await settle(250)
+      if (effortDown > 0) {
+        proc.write('\x1b[B'.repeat(effortDown))
+        await settle(250)
+      }
+      proc.write('\r')
+      await settle(300)
+      await waitMarker('模型已切换', /模型已切换：/)
+      await settle()
+      const path = findSessionLog(sessionId)
+      if (!path) return null
+      const last = readSessionEvents(path).filter((event) => event.type === 'model/selection').at(-1)
+      return last ? routeOf(last.data) : null
+    }
+    const moves = [
+      [0, 1, 0],
+      [0, 2, 0],
+      [1, 0, 0],
+      [1, 1, 0],
+      [2, 0, 0],
+    ]
+    const tried = []
+    let picked = null
+    for (const [providerDown, modelDown, effortDown] of moves) {
+      picked = await pickRoute(providerDown, modelDown, effortDown)
+      tried.push(picked)
+      if (picked !== null && picked !== routeOf(decoy)) break
+      console.log(`  选型重试（${providerDown}/${modelDown}/${effortDown} → ${picked ?? 'null'}）`)
+    }
+    if (picked === null) fail(`日志里没有 durable model/selection：/model 只改了内存与 settings`)
+    if (picked === routeOf(decoy)) {
+      fail(`候选选型都与 composition 默认相同（${JSON.stringify(tried)}），本次探针无法区分来源`)
+    }
+    console.log(`模型记录 ✔  日志落盘 model/selection=${picked}（composition 默认 ${routeOf(decoy)}）`)
+
+    // Boot A must be GONE before boot B resumes the session: a live owner
+    // holds the persistence lease.
+    proc.write('\x03')
+    const exitedBy = Date.now() + 10_000
+    while (!raw.includes('<<< PROCESS EXITED') && Date.now() < exitedBy) await sleep(200)
+    if (!raw.includes('<<< PROCESS EXITED')) fail('首启进程未在 10s 内退出')
+    await sleep(500)
+
+    // 3) Resume under a decoy override: the LOG's route must win.
+    try {
+      writeFileSync(APP_LOG2, '')
+    } catch {}
+    procB = pty.spawn(process.execPath, [DSH_BIN, '--profile', 'orca'], {
+      name: 'xterm-256color',
+      cols: COLS,
+      rows: ROWS,
+      cwd: CWD,
+      env: {
+        ...process.env,
+        ORCA_LOG: APP_LOG2,
+        ORCA_RESUME_SESSION: sessionId,
+        ORCA_PROVIDER: decoy.provider,
+        ORCA_MODEL: decoy.model,
+      },
+    })
+    let exitedB = false
+    procB.onExit(() => {
+      exitedB = true
+    })
+    const resumedDeadline = Date.now() + 30_000
+    let appText = ''
+    for (;;) {
+      try {
+        appText = stripAnsi(readFileSync(APP_LOG2, 'utf8'))
+      } catch {
+        appText = ''
+      }
+      if (appText.includes(`↳ 模型 ${picked}`)) break
+      if (Date.now() > resumedDeadline) {
+        fail(`恢复会话未沿用日志里的路由 ${picked}\n${appText.slice(-800)}`)
+      }
+      await sleep(200)
+    }
+    if (appText.includes(`↳ 模型 ${routeOf(decoy)}`)) {
+      fail(`恢复会话用了 composition 覆盖（${routeOf(decoy)}）而不是日志记录`)
+    }
+    console.log(`模型记忆 ✔  恢复会话渲染 ${picked}，未采用诱饵 ${routeOf(decoy)}`)
+
+    // Every boot ends the way a user ends it (Ctrl+C → disposer → exit), so no
+    // half-killed ConPTY child outlives the probe and keeps this pipeline open.
+    procB.write('\x03')
+    const byB = Date.now() + 10_000
+    while (!exitedB && Date.now() < byB) await sleep(200)
+    if (!exitedB) fail('恢复进程未在 10s 内退出')
+    await sleep(400)
+    markSettledSafe(globalTimer)
+    try {
+      writeFileSync('C:/Users/Mayn/Desktop/dsh-orca/probe-last-raw.log', raw)
+    } catch {}
+    writeFileSync(SETTINGS, settingsSnapshot)
+    console.log('state probe 通过 ✔（工作区归属 + durable 模型记录 + 恢复沿用）')
+    process.exit(0)
+  } catch (error) {
+    try {
+      procB?.kill()
+    } catch {}
+    try {
+      proc.kill()
+    } catch {}
+    writeFileSync(SETTINGS, settingsSnapshot)
     fail(error instanceof Error ? error.message : String(error))
   }
 }

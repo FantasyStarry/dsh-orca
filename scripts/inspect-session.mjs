@@ -1,79 +1,29 @@
 /**
  * Diagnostic: decompress one persisted session log (`.jsonl.zstd`, format v3)
  * and report the facts a probe needs to assert — the injected model-switch
- * notice and any `file` content blocks.
+ * notice, any `file` content blocks, and the durable route records
+ * (`model/selection` / `request/header`) the model-selection fold reads.
  *
- * Usage: node scripts/inspect-session.mjs <path-to-session.v3.jsonl.zstd>
+ * Usage: node scripts/inspect-session.mjs [<session.v3.jsonl.zstd> | <session-id>]
  */
 
-import { readFileSync, readdirSync, statSync } from 'node:fs'
-import { join } from 'node:path'
-import { zstdDecompressSync } from 'node:zlib'
+import {
+  DEFAULT_DSH_HOME,
+  findSessionLog,
+  newestSessionLog,
+  readSessionEvents,
+} from './session-log.mjs'
 
-/** zstd frame magic (`0xFD2FB528` little-endian). */
-const MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
-
-/**
- * Decompress a whole `.jsonl.zstd` log. The kernel appends CONCATENATED zstd
- * frames (header, then data), and Node's zstd decoder stops at the first
- * frame — so locate each frame by its magic and decode the slices
- * independently, merging a slice with the next when the magic was a false
- * positive inside a payload.
- */
-function decompressFrames(buffer) {
-  const starts = []
-  for (let i = 0; i + 4 <= buffer.length; i++) {
-    if (buffer.compare(MAGIC, 0, 4, i, i + 4) === 0) starts.push(i)
-  }
-  if (starts[0] !== 0) starts.unshift(0)
-  const parts = []
-  for (let index = 0; index < starts.length; index++) {
-    let ok = null
-    for (let end = index + 1; end <= starts.length; end++) {
-      const slice = buffer.subarray(starts[index], end < starts.length ? starts[end] : buffer.length)
-      try {
-        ok = zstdDecompressSync(slice)
-        index = end - 1
-        break
-      } catch {
-        // A false-positive magic inside a payload: extend the slice.
-      }
-    }
-    if (ok !== null) parts.push(ok)
-  }
-  return Buffer.concat(parts).toString('utf8')
-}
-
-const SESSIONS = 'C:/Users/Mayn/.dsh/sessions/--C-Users-Mayn-Desktop-dsh-orca--'
-
-/** Newest persisted log under the orca session root (recursive). */
-function newestLog(dir) {
-  let best = null
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    const full = join(dir, entry.name)
-    if (entry.isDirectory()) {
-      const nested = newestLog(full)
-      if (nested && (!best || nested.mtime > best.mtime)) best = nested
-      continue
-    }
-    if (!entry.name.endsWith('.zstd')) continue
-    const mtime = statSync(full).mtimeMs
-    if (!best || mtime > best.mtime) best = { path: full, mtime }
-  }
-  return best
-}
-
-const target = process.argv[2] ?? newestLog(SESSIONS)?.path
+const ORCA_SESSIONS = `${DEFAULT_DSH_HOME}/sessions/--C-Users-Mayn-Desktop-dsh-orca--`
+const arg = process.argv[2]
+const target = arg === undefined ? newestSessionLog(ORCA_SESSIONS)?.path : findSessionLog(arg) ?? arg
 if (!target) {
   console.error('no session log found')
   process.exit(1)
 }
 console.log(`log: ${target}`)
 
-const events = decompressFrames(readFileSync(target))
-  .split('\n')
-  .filter((line) => line.trim() !== '')
-  .map((line) => JSON.parse(line))
+const events = readSessionEvents(target)
 console.log(`events: ${events.length}`)
 
 const notices = events.filter(
@@ -94,6 +44,17 @@ console.log(`user messages carrying a file block: ${fileMessages.length}`)
 for (const message of fileMessages) {
   const file = message.data.content.find((block) => block.type === 'file')
   console.log(`  source=${JSON.stringify(message.data.source)} file=${JSON.stringify(file.attachment)}`)
+}
+
+const picks = events.filter((event) => event.type === 'model/selection')
+console.log(`model/selection events: ${picks.length}`)
+for (const pick of picks) console.log(`  seq=${pick.seq} data=${JSON.stringify(pick.data)}`)
+
+const headers = events.filter((event) => event.type === 'request/header')
+const lastHeader = headers.at(-1)
+console.log(`request/header events: ${headers.length}`)
+if (lastHeader) {
+  console.log(`  last seq=${lastHeader.seq} config=${JSON.stringify(lastHeader.data?.header?.config)}`)
 }
 
 const types = new Map()

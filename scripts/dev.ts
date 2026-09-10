@@ -30,6 +30,7 @@ import { boxBottom, boxLine, boxTop } from '../src/tui/box.js'
 import type {
   AgentHandle,
   CreateAgentOptions,
+  EpochHeader,
   KernelAgentsService,
   KernelContext,
   ResumeAgentOptions,
@@ -45,12 +46,13 @@ const sleep = (ms: number): Promise<void> => new Promise<void>((resolve) => setT
  * events into the reconstructed Session, so `snapshotEvents()` (not a query
  * fallback) is what a remount projects.
  */
-function durableHistory(): SessionEvent[] {
+function durableHistory(extra: SessionEvent[] = []): SessionEvent[] {
   const now = Date.now()
   return [
     { type: 'turn/start', seq: 0, time: now, data: { turn: 1 } },
     { type: 'user/message', seq: 1, time: now, data: { content: [{ type: 'text', text: 'hi 历史' }], source: { kind: 'user' } } },
     { type: 'turn/end', seq: 2, time: now, data: { turn: 1, reason: { kind: 'completed' } } },
+    ...extra.map((event, index) => ({ ...event, seq: 3 + index })),
   ] as SessionEvent[]
 }
 
@@ -249,6 +251,24 @@ class FakeKernel implements KernelContext {
   private fileSeq = 0
   /** When true, `sessionQuery` reads as unregistered (late-registration probe). */
   hideSessionQuery = false
+  /** When true, `workspaceRegistry` reads as unregistered (degradation probe). */
+  hideWorkspaceRegistry = false
+  /**
+   * The ONE directory the fake workspace owns; `undefined` models a cwd the
+   * user never added as a workspace (the attach must then do nothing).
+   */
+  workspacePath: string | undefined = process.cwd()
+  /** When true, `attachSession` rejects (header cwd validation refusal). */
+  workspaceAttachFails = false
+  /** Session ids the fake workspace has attached, in call order. */
+  readonly workspaceAttached: string[] = []
+  /**
+   * Extra durable events a resumed session's log carries (the model/selection
+   * + request/header records the durable-selection fold reads back).
+   */
+  resumeExtras: SessionEvent[] = []
+  /** cwd `/resume` reports in the reconstructed session's header. */
+  resumeCwd: string | undefined = process.cwd()
   /** When true, `agentPresets.mount` rejects (preset-failure fallback probe). */
   presetMountFails = false
   /** Kernel-registered commands beyond Orca's own table (menu discovery probe). */
@@ -325,7 +345,7 @@ class FakeKernel implements KernelContext {
             status: 'fulfilled' as const,
             value: sessionId === 'session-aaa' ? { title: { title: '假标题A', updatedAt: Date.now() } } : {},
           })),
-        readSession: async (_sessionId: string) => ({ events: durableHistory() }),
+        readSession: async (_sessionId: string) => ({ events: durableHistory(this.resumeExtras) }),
       } as T
     }
     if (name === 'sessionTitle') {
@@ -361,6 +381,14 @@ class FakeKernel implements KernelContext {
         },
         overrideOf: () => this.fakePolicy,
         request: async () => 'unavailable' as const,
+      } as T
+    }
+    if (name === 'workspaceRegistry') {
+      if (this.hideWorkspaceRegistry) return undefined
+      const kernel = this
+      return {
+        list: (): unknown[] => (kernel.workspacePath === undefined ? [] : [kernel.workspaceView()]),
+        resolveByPath: async (path: string) => (path === kernel.workspacePath ? kernel.workspaceView() : undefined),
       } as T
     }
     if (name === 'sessions') {
@@ -471,6 +499,55 @@ class FakeKernel implements KernelContext {
   }
 
   /**
+   * Append one event through the same path `Session.append` uses in the real
+   * kernel: it enters the log AND is published on `session/event`.
+   */
+  appendEvent(sessionId: string, type: string, data: unknown): SessionEvent {
+    const event: SessionEvent = { type, seq: this.seq++, time: Date.now(), data }
+    this.logged.push({ sessionId, event })
+    for (const listener of this.listeners.get('session/event') ?? []) listener({ id: sessionId }, event)
+    return event
+  }
+
+  /**
+   * The kernel's `Session.requestHeader()` fold: the header of the LAST
+   * `request/header` event in the log, or undefined before the first one.
+   */
+  private requestHeaderOf(sessionId: string): EpochHeader | undefined {
+    let header: EpochHeader | undefined
+    for (const event of this.loggedEvents(sessionId)) {
+      if (event.type !== 'request/header') continue
+      const data = event.data as { readonly header?: EpochHeader } | undefined
+      if (data?.header !== undefined) header = data.header
+    }
+    return header
+  }
+
+  /** The one fake workspace the registered `workspaceRegistry` resolves. */
+  private workspaceView(): {
+    id: string
+    path: string | undefined
+    title: string
+    sessionIds: readonly string[]
+    attachSession(sessionId: string): Promise<void>
+  } {
+    const kernel = this
+    return {
+      id: 'ws-fake',
+      path: this.workspacePath,
+      title: 'fake-workspace',
+      // LIVE view: the app must see its own earlier attach reflected here.
+      sessionIds: this.workspaceAttached,
+      attachSession: async (sessionId: string): Promise<void> => {
+        if (this.workspaceAttachFails) {
+          throw new Error(`cannot attach session '${sessionId}': its cwd resolves elsewhere`)
+        }
+        kernel.workspaceAttached.push(sessionId)
+      },
+    }
+  }
+
+  /**
    * Publish one kernel-lifecycle cordis event (NOT a session event) — the
    * shape `ctx.on(name, …)` listeners receive.
    */
@@ -512,10 +589,16 @@ class FakeKernel implements KernelContext {
       }
       const session: Session = {
         id: options.sessionId,
+        header: {
+          id: options.sessionId,
+          ...(typeof options.meta?.cwd === 'string' ? { cwd: options.meta.cwd } : {}),
+          createdAt: Date.now(),
+        },
         events: [],
         snapshotEvents: (): readonly SessionEvent[] => kernel.loggedEvents(options.sessionId),
+        requestHeader: (): EpochHeader | undefined => kernel.requestHeaderOf(options.sessionId),
         append(type, data): SessionEvent {
-          return { type, seq: kernel.seq++, time: Date.now(), data }
+          return kernel.appendEvent(options.sessionId, type, data)
         },
       }
       const agent = {
@@ -564,10 +647,17 @@ class FakeKernel implements KernelContext {
       this.record.resumedId = options.resumeSessionId
       // The real resume loads the stored log into the reconstructed session;
       // keep the fake's seq counter ahead of the replayed prefix.
-      const history = durableHistory()
+      const history = durableHistory(this.resumeExtras)
       this.durable.set(options.resumeSessionId, history)
       this.seq = Math.max(this.seq, history.length)
-      return this.agentsService.create({ sessionId: options.resumeSessionId, agentOptions: options.agentOptions })
+      // The reconstructed session's header comes from the STORED log, not from
+      // the caller — the fake reproduces that, so workspace accounting sees a
+      // resumed session exactly as it sees a fresh one.
+      return this.agentsService.create({
+        sessionId: options.resumeSessionId,
+        agentOptions: options.agentOptions,
+        ...(this.resumeCwd === undefined ? {} : { meta: { cwd: this.resumeCwd } }),
+      })
     },
     get: (id: string) => this.liveAgents.get(id) as AgentHandle['agent'] | undefined,
     list: () => [...this.liveAgents.values()] as Array<AgentHandle['agent']>,
@@ -1733,6 +1823,212 @@ async function main(): Promise<void> {
     if (flow11().includes('agent 启动失败')) problems.push('phase10b：回退成功却报了启动失败')
     dispose11()
     await sleep(20)
+  }
+
+  // ── Phase 11: 工作区归属——TUI 会话登记进它 cwd 的工作区 ───────────────────
+  // The web sidebar groups sessions by workspace MEMBERSHIP
+  // (`workspace.json`'s `sessionIds`), and membership is host-side only: the
+  // browser cannot file an ungrouped row either. A TUI session that is never
+  // attached can therefore only ever sit in the ungrouped pile.
+  {
+    const writes12: string[] = []
+    const stdin12 = new FakeStdin()
+    const kernel12 = new FakeKernel(true)
+    const dispose12 = bootstrapApp(
+      kernel12,
+      { provider: '', model: '', fullscreen: false },
+      { stdout: () => makeStdout(writes12), stdin: () => stdin12 },
+    )
+    await sleep(300)
+    const first12 = kernel12.record.createOptions?.sessionId
+    if (first12 === undefined || kernel12.workspaceAttached[0] !== first12) {
+      problems.push(`phase11：首个会话未登记工作区：${JSON.stringify(kernel12.workspaceAttached)}`)
+    }
+    for (const ch of '/new') stdin12.text(ch)
+    stdin12.key('return')
+    await sleep(400)
+    const second12 = kernel12.record.createOptions?.sessionId
+    if (kernel12.workspaceAttached.length !== 2 || kernel12.workspaceAttached[1] !== second12) {
+      problems.push(`phase11：/new 的会话未登记工作区：${JSON.stringify(kernel12.workspaceAttached)}`)
+    }
+    // A session already accounted must NOT be written again (the registry
+    // mutation is a durable file write shared with the web process).
+    const accounted12 = kernel12.workspaceAttached.length
+    dispose12()
+    await sleep(50)
+    const writes12b: string[] = []
+    const dispose12b = bootstrapApp(
+      kernel12,
+      { provider: '', model: '', fullscreen: false },
+      { stdout: () => makeStdout(writes12b), stdin: () => new FakeStdin() },
+    )
+    await sleep(300)
+    if (kernel12.workspaceAttached.length !== accounted12) {
+      problems.push(`phase11：已登记的会话被重复登记：${JSON.stringify(kernel12.workspaceAttached)}`)
+    }
+    dispose12b()
+    await sleep(20)
+
+    // Degradation (#183): every missing/failing seam is silent, and the
+    // session still connects. Each boot gets its own remount marker so it
+    // creates a session rather than resuming the previous case's.
+    const isolatedBoot = async (kernel: FakeKernel, tag: string): Promise<string> => {
+      const file = join(tmpdir(), `orca-smoke-${process.pid}-ws-${tag}.json`)
+      process.env['ORCA_LAST_SESSION_FILE'] = file
+      try {
+        rmSync(file)
+      } catch {
+        // Absent is the normal case.
+      }
+      const writes: string[] = []
+      const dispose = bootstrapApp(
+        kernel,
+        { provider: '', model: '', fullscreen: false },
+        { stdout: () => makeStdout(writes), stdin: () => new FakeStdin() },
+      )
+      await sleep(300)
+      const visible = stripSgr(writes.join(''))
+      dispose()
+      await sleep(20)
+      return visible
+    }
+    const noRegistry12 = new FakeKernel(true)
+    noRegistry12.hideWorkspaceRegistry = true
+    const visibleNoRegistry = await isolatedBoot(noRegistry12, 'none')
+    if (!visibleNoRegistry.includes('session 已连接') || visibleNoRegistry.includes('agent 启动失败')) {
+      problems.push('phase11：缺 workspaceRegistry 时未降级启动')
+    }
+    const unowned12 = new FakeKernel(true)
+    unowned12.workspacePath = undefined
+    await isolatedBoot(unowned12, 'unowned')
+    if (unowned12.workspaceAttached.length !== 0) {
+      problems.push(`phase11：没有对应工作区时仍尝试登记：${JSON.stringify(unowned12.workspaceAttached)}`)
+    }
+    const refused12 = new FakeKernel(true)
+    refused12.workspaceAttachFails = true
+    const visibleRefused = await isolatedBoot(refused12, 'refused')
+    if (refused12.workspaceAttached.length !== 0) {
+      problems.push(`phase11：被拒的登记不应算成功：${JSON.stringify(refused12.workspaceAttached)}`)
+    }
+    if (!visibleRefused.includes('session 已连接') || visibleRefused.includes('agent 启动失败')) {
+      problems.push('phase11：登记被拒时未降级启动')
+    }
+  }
+
+  // ── Phase 12: 会话记录的模型——TUI 与 web 读同一份 durable 记录 ─────────────
+  // The kernel's own reading order is: the last still-unconsumed
+  // `model/selection` event, else the last `request/header` config, else the
+  // composition default. The web host appends that event on a pick; the TUI
+  // must append AND read it, or a pick is invisible to the web and a session
+  // opened here forgets the model it ran on.
+  {
+    // (a) A TUI pick becomes a durable `model/selection` in the session log.
+    const writes13: string[] = []
+    const stdin13 = new FakeStdin()
+    const kernel13 = new FakeKernel(true)
+    const dispose13 = bootstrapApp(
+      kernel13,
+      { provider: '', model: '', fullscreen: false },
+      { stdout: () => makeStdout(writes13), stdin: () => stdin13 },
+    )
+    await sleep(300)
+    for (const ch of '/model') stdin13.text(ch)
+    stdin13.key('return')
+    await sleep(150)
+    stdin13.key('return') // provider fake-a
+    await sleep(150)
+    stdin13.key('return') // model fake-a-m1
+    await sleep(150)
+    stdin13.key('return') // effort 模型默认
+    await sleep(250)
+    const picked13 = kernel13
+      .loggedEvents(kernel13.record.createOptions?.sessionId ?? '')
+      .filter((event) => event.type === 'model/selection')
+    const last13 = picked13.at(-1)?.data as { provider?: string; model?: string; reasoningEffort?: string } | undefined
+    if (last13?.provider !== 'fake-a' || last13?.model !== 'fake-a-m1') {
+      problems.push(`phase12：/model 未落 durable model/selection：${JSON.stringify(last13 ?? null)}`)
+    }
+    if (last13 !== undefined && last13.reasoningEffort !== undefined) {
+      problems.push(`phase12：模型默认的选型不应带 effort：${JSON.stringify(last13)}`)
+    }
+    if (kernel13.record.selectionSaved?.provider !== 'fake-a') {
+      problems.push('phase12：/model 未写全局默认（settings）')
+    }
+    dispose13()
+    await sleep(20)
+
+    // (b) A resumed session runs on the route ITS LOG records, not on this
+    // process's default: mount → dispose → remount with a scripted durable log.
+    const extraSeq = { n: 0 }
+    const resumeVisible = async (
+      extras: SessionEvent[],
+      tag: string,
+    ): Promise<{ visible: string; kernel: FakeKernel }> => {
+      extraSeq.n += 1
+      const file = join(tmpdir(), `orca-smoke-${process.pid}-resume-${tag}-${extraSeq.n}.json`)
+      process.env['ORCA_LAST_SESSION_FILE'] = file
+      try {
+        rmSync(file)
+      } catch {
+        // Absent is the normal case.
+      }
+      const kernel = new FakeKernel(true)
+      const disposeA = bootstrapApp(
+        kernel,
+        { provider: '', model: '', fullscreen: false },
+        { stdout: () => makeStdout([]), stdin: () => new FakeStdin() },
+      )
+      await sleep(250)
+      disposeA()
+      await sleep(40)
+      kernel.resumeExtras = extras
+      const writes: string[] = []
+      const disposeB = bootstrapApp(
+        kernel,
+        { provider: '', model: '', fullscreen: false },
+        { stdout: () => makeStdout(writes), stdin: () => new FakeStdin() },
+      )
+      await sleep(300)
+      const visible = stripSgr(writes.join(''))
+      disposeB()
+      await sleep(20)
+      return { visible, kernel }
+    }
+    const header = (config: Record<string, unknown>, adapterDefaults?: Record<string, unknown>): SessionEvent =>
+      ({
+        type: 'request/header',
+        seq: 0,
+        time: Date.now(),
+        data: { header: { config, ...(adapterDefaults === undefined ? {} : { adapterDefaults }) }, reason: 'initial' },
+      }) as SessionEvent
+    const pick = (provider: string, model: string, reasoningEffort?: string): SessionEvent =>
+      ({
+        type: 'model/selection',
+        seq: 0,
+        time: Date.now(),
+        data: { provider, model, ...(reasoningEffort === undefined ? {} : { reasoningEffort }) },
+      }) as SessionEvent
+
+    const recorded = await resumeVisible([header({ provider: 'rec-p', model: 'rec-m', reasoningEffort: 'high' })], 'header')
+    if (!recorded.visible.includes('↳ 模型 rec-p/rec-m(high)')) {
+      problems.push(`phase12：恢复会话未沿用日志里的路由：${recorded.visible.slice(-400)}`)
+    }
+    const pending = await resumeVisible(
+      [header({ provider: 'rec-p', model: 'rec-m' }), pick('sel-p', 'sel-m', 'low')],
+      'pending',
+    )
+    if (!pending.visible.includes('↳ 模型 sel-p/sel-m(low)')) {
+      problems.push(`phase12：未生效的 model/selection 未优先：${pending.visible.slice(-400)}`)
+    }
+    // An effort the ADAPTER materialized is not a route choice: it must not be
+    // re-pinned as one, so this session announces the route WITHOUT an effort.
+    const adapterDefault = await resumeVisible(
+      [header({ provider: 'ad-p', model: 'ad-m', reasoningEffort: 'medium' }, { reasoningEffort: true })],
+      'adapter',
+    )
+    if (!adapterDefault.visible.includes('↳ 模型 ad-p/ad-m') || adapterDefault.visible.includes('ad-m(medium)')) {
+      problems.push(`phase12：适配器默认 effort 被当成选型：${adapterDefault.visible.slice(-400)}`)
+    }
   }
 
   if (problems.length > 0) {
