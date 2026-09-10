@@ -431,6 +431,8 @@ export interface KernelWorkspace {
   readonly id: string
   readonly path: string
   readonly title: string
+  /** ISO-8601 stamp refreshed by every durable mutation of this record. */
+  readonly updatedAt: string
   readonly sessionIds: readonly string[]
   /**
    * Record one session as owned by this workspace. Rejects (never no-ops) when
@@ -452,6 +454,8 @@ export interface KernelWorkspace {
 export interface KernelWorkspaceRegistry {
   /** Ordered registry projection; performs no persistence reads. */
   list(): readonly KernelWorkspace[]
+  /** Registry-global archive set (durable order, most recent last). */
+  readonly archivedSessionIds?: readonly string[]
   /**
    * Resolve the workspace owning one directory, without creating or mutating
    * anything: an existing unowned directory resolves to `undefined`, a path

@@ -17,7 +17,7 @@
 5. **TUI 活动期间 stdout 安静**：诊断走 stderr（`ORCA_DEBUG=1`），绝不 `console.log` 到 stdout。
 6. **事件落地规则**：Orca 目前只 append 一种 session 事件——`model/selection`（内核已知的 log-only 类型，形状与 web 端 `session.selectModel` 完全一致），不带 surface 元数据；不存在自造事件类型。将来若要新增，必须是 log-only 且能被安全跳过（优先复用内核已知类型；真正自造的类型要带 `ignorable: true`，0.1.5 起内核用事件自带的 `ignorable` 声明"跳过是否安全"而不是事件名注册）。
 7. **清理挂 `ctx.effect`**：每个 disposer 都要能在插件卸载时恢复终端/释放句柄。
-8. **写内核状态要"只加自己的"**：Orca 会写的工作区状态仅限于「把自己刚创建的会话 `attachSession` 到已存在的工作区」（`~/.dsh/storages/workspace.json` 与 web 进程共享）。不得创建/改名/删除/排序工作区，不得为别的会话登记；被拒/缺服务一律静默降级。
+8. **写内核状态要"只加自己的"**：Orca 会写的工作区状态仅限于「把自己刚创建的会话 `attachSession` 到已存在的工作区」（`~/.dsh/storages/workspace.json` 与 web 进程共享）。不得创建/改名/删除/排序工作区，不得为别的会话登记；被拒/缺服务一律静默降级。**写之前必须过漂移守卫**（`workspaceMediumFingerprint()` vs `workspaceRegistryFingerprint()`）：账本是被整份覆盖的单文档，且 web 进程只在启动时读一次——探针/测试用 `ORCA_WORKSPACE_FILE` 指向临时文件，绝不碰用户真实账本。
 
 ## 工程约定
 

@@ -13,7 +13,8 @@ orca / dsh-orca   # 均等价于 dsh --profile orca
 - 工具调用卡片：运行状态、结果、diff 高亮
 - 审批面板：逐次确认 / yolo 自动放行
 - `/model` 三段式切换 provider / model / 思考强度；选型会以**内核持久事件** `model/selection` 落进会话日志（与 web 端 `session.selectModel` 同一种记录），并写入 `agent-default-model` 默认值。恢复会话时按内核的读法取值：未生效的 `model/selection` → 会话最后一次 `request/header` → composition 默认，所以「这个会话用哪个模型」在 TUI 与 web 之间一致
-- 会话自动登记进它 cwd 对应的**工作区**（`@deepseek-ai/dsh-workspace` 的 `attachSession`），web 侧栏因此能把 TUI 会话归到对应工作区分组，而不是留在「未分组」；只登记已存在的工作区，不创建/改名/排序
+- 会话自动登记进它 cwd 对应的**工作区**（`@deepseek-ai/dsh-workspace` 的 `attachSession`），web 侧栏因此能把 TUI 会话归到对应工作区分组，而不是留在「未分组」；只登记已存在的工作区，不创建/改名/排序。
+  注意这是**跨进程共享的单文档账本**：写入是整份覆盖，而 web 进程只在启动时读一次。所以（1）TUI 登记后需要**重启一次 web 服务**才能在侧栏看到归属；（2）若 web 在本 TUI 启动后写过账本，TUI 会**拒绝登记**（漂移守卫，避免用旧快照覆盖你在 web 里做的改动），此时改天重开 TUI 即可重试
 - `/preset` 切换 Agent 预设
 - 附件输入：`/img`（`/attach`）附加本地文件——图片走 `image` 块、其他文件走 `file` 块；`Ctrl+V` / `Alt+V` 粘贴图片，输入框内联 `[image #N]` / `[file #N]`，支持删除
 - `@` 文件补全
@@ -128,6 +129,7 @@ dsh-orca
 | `ORCA_DEBUG` | `1` 时输出诊断日志到 stderr |
 | `ORCA_LOG` | 记录 stdout 字节流到指定文件 |
 | `ORCA_LAST_SESSION_FILE` | 覆盖 last-session 标记文件路径 |
+| `ORCA_WORKSPACE_FILE` | 覆盖工作区账本路径（漂移守卫读它；测试用） |
 | `ORCA_SETTINGS_FILE` | 覆盖本地设置文件路径 |
 
 ## 开发

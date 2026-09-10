@@ -625,7 +625,11 @@ if (process.argv.includes('--state')) {
       fail(`当前 cwd 不是已登记工作区：${CWD}；注册表里有 ${JSON.stringify(Object.values(JSON.parse(readFileSync(WORKSPACES, 'utf8')).tables.workspaces).map((r) => r.path))}`)
     }
     if (!(record.sessionIds ?? []).includes(sessionId)) {
-      fail(`会话未登记到工作区 ${record.path}（${sessionId}）：${JSON.stringify(record.sessionIds.slice(0, 6))}`)
+      fail(
+        `会话未登记到工作区 ${record.path}（${sessionId}）：${JSON.stringify(record.sessionIds.slice(0, 6))}\n` +
+          `账本当前更新戳：${JSON.stringify(Object.values(JSON.parse(readFileSync(WORKSPACES, 'utf8')).tables.workspaces).map((r) => [r.path, r.updatedAt]))}` +
+          `\n若 web 进程在本 TUI 启动后写过工作区账本，TUI 会按漂移守卫拒绝写入（避免用旧快照覆盖）：重启 web 服务或本次 TUI 会话即可重试`,
+      )
     }
     console.log(`工作区归属 ✔  ${record.path} ⊃ ${sessionId}`)
 

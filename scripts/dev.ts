@@ -258,10 +258,49 @@ class FakeKernel implements KernelContext {
    * user never added as a workspace (the attach must then do nothing).
    */
   workspacePath: string | undefined = process.cwd()
+  /** The workspace record's durable stamp (the medium-drift guard reads it). */
+  workspaceUpdatedAt = '2026-01-01T00:00:00.000Z'
   /** When true, `attachSession` rejects (header cwd validation refusal). */
   workspaceAttachFails = false
+  /** When true, the medium drifts exactly while a resolve is in flight. */
+  workspaceDriftsOnResolve = false
   /** Session ids the fake workspace has attached, in call order. */
   readonly workspaceAttached: string[] = []
+
+  /**
+   * Publish this fake workspace's state to the sandboxed medium file, the way
+   * the real domain would after a mutation. The app's drift guard compares the
+   * medium against its live registry, so any test that expects an attach must
+   * have the medium in sync; {@link driftWorkspaceMedium} simulates the WEB
+   * process committing after this process read it.
+   */
+  writeWorkspaceMedium(updatedAt = this.workspaceUpdatedAt): void {
+    const file = process.env['ORCA_WORKSPACE_FILE']
+    if (file === undefined || this.workspacePath === undefined) return
+    writeFileSync(
+      file,
+      JSON.stringify({
+        unit: { name: 'workspace', version: 2 },
+        global: { initialized: true, workspaceIds: ['ws-fake'], archivedSessionIds: [] },
+        tables: {
+          workspaces: {
+            'ws-fake': {
+              path: this.workspacePath,
+              title: 'fake-workspace',
+              createdAt: this.workspaceUpdatedAt,
+              updatedAt,
+              sessionIds: [...this.workspaceAttached],
+            },
+          },
+        },
+      }),
+    )
+  }
+
+  /** Simulate another process committing a workspace change (drift). */
+  driftWorkspaceMedium(): void {
+    this.writeWorkspaceMedium('2026-06-06T06:06:06.000Z')
+  }
   /**
    * Extra durable events a resumed session's log carries (the model/selection
    * + request/header records the durable-selection fold reads back).
@@ -388,7 +427,14 @@ class FakeKernel implements KernelContext {
       const kernel = this
       return {
         list: (): unknown[] => (kernel.workspacePath === undefined ? [] : [kernel.workspaceView()]),
-        resolveByPath: async (path: string) => (path === kernel.workspacePath ? kernel.workspaceView() : undefined),
+        get archivedSessionIds(): readonly string[] {
+          return []
+        },
+        resolveByPath: async (path: string) => {
+          if (path !== kernel.workspacePath) return undefined
+          if (kernel.workspaceDriftsOnResolve) kernel.driftWorkspaceMedium()
+          return kernel.workspaceView()
+        },
       } as T
     }
     if (name === 'sessions') {
@@ -528,6 +574,7 @@ class FakeKernel implements KernelContext {
     id: string
     path: string | undefined
     title: string
+    updatedAt: string
     sessionIds: readonly string[]
     attachSession(sessionId: string): Promise<void>
   } {
@@ -536,6 +583,7 @@ class FakeKernel implements KernelContext {
       id: 'ws-fake',
       path: this.workspacePath,
       title: 'fake-workspace',
+      updatedAt: this.workspaceUpdatedAt,
       // LIVE view: the app must see its own earlier attach reflected here.
       sessionIds: this.workspaceAttached,
       attachSession: async (sessionId: string): Promise<void> => {
@@ -740,6 +788,14 @@ async function main(): Promise<void> {
   process.env['ORCA_LAST_SESSION_FILE'] = join(tmpdir(), `orca-smoke-${process.pid}.json`)
   try {
     rmSync(process.env['ORCA_LAST_SESSION_FILE'])
+  } catch {
+    // Absent on the first run — nothing to clear.
+  }
+  // The workspace medium the drift guard reads (see phase 11): sandboxed to a
+  // temp file so the smoke never inspects the user's real workspace registry.
+  process.env['ORCA_WORKSPACE_FILE'] = join(tmpdir(), `orca-smoke-workspace-${process.pid}.json`)
+  try {
+    rmSync(process.env['ORCA_WORKSPACE_FILE'])
   } catch {
     // Absent on the first run — nothing to clear.
   }
@@ -1834,6 +1890,9 @@ async function main(): Promise<void> {
     const writes12: string[] = []
     const stdin12 = new FakeStdin()
     const kernel12 = new FakeKernel(true)
+    // The medium must already match the registry the app will read, or the
+    // drift guard refuses to write (that IS the guard's contract).
+    kernel12.writeWorkspaceMedium()
     const dispose12 = bootstrapApp(
       kernel12,
       { provider: '', model: '', fullscreen: false },
@@ -1880,6 +1939,7 @@ async function main(): Promise<void> {
       } catch {
         // Absent is the normal case.
       }
+      kernel.writeWorkspaceMedium()
       const writes: string[] = []
       const dispose = bootstrapApp(
         kernel,
@@ -1912,6 +1972,14 @@ async function main(): Promise<void> {
     }
     if (!visibleRefused.includes('session 已连接') || visibleRefused.includes('agent 启动失败')) {
       problems.push('phase11：登记被拒时未降级启动')
+    }
+    // Another writer (the web app) committed after this process read the
+    // registry: the TUI must NOT publish its stale document over that.
+    const drifted12 = new FakeKernel(true)
+    drifted12.workspaceDriftsOnResolve = true
+    await isolatedBoot(drifted12, 'drift')
+    if (drifted12.workspaceAttached.length !== 0) {
+      problems.push(`phase11：账本已被其它进程改写却仍写了归属：${JSON.stringify(drifted12.workspaceAttached)}`)
     }
   }
 

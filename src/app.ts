@@ -60,6 +60,7 @@ import type {
   KernelSessionQueryService,
   KernelSessionTitleService,
   KernelSessionsService,
+  KernelWorkspace,
   KernelWorkspaceRegistry,
   Session,
   SessionEvent,
@@ -1579,12 +1580,16 @@ export function bootstrapApp(
    * leaving it in the ungrouped pile. Workspace membership is durable host
    * state (`~/.dsh/storages/workspace.json`) shared with the web process; the
    * TUI only ever ADDs its own live session to a workspace that already
-   * exists — it never creates, renames, reorders or archives anything.
+   * exists — it never creates, renames, reorders or archives anything — and
+   * only while the medium still matches the registry this process read (see
+   * the guard below). Two long-lived processes both holding a whole-document
+   * snapshot cannot both be writers; the TUI yields instead of winning.
    *
    * Soft everywhere (#183): no `workspaceRegistry` (a profile without the
    * Orca bundle's `workspace` row), no workspace for this cwd (the directory
-   * was never added as one), or a refused attach all degrade to silence — a
-   * session that cannot be filed is still a working session.
+   * was never added as one), a medium that moved on, or a refused attach all
+   * degrade to silence — a session that cannot be filed is still a working
+   * session.
    */
   const attachSessionToWorkspace = async (session: Session): Promise<void> => {
     const registry = getWorkspaceRegistry()
@@ -1599,6 +1604,17 @@ export function bootstrapApp(
       }
       if (workspace.sessionIds.includes(session.id)) {
         dbg(`会话本就在工作区 ${workspace.path} 内`)
+        return
+      }
+      // NEVER write from a snapshot the medium has moved past: the registry
+      // medium is a single JSON document republished WHOLE by whichever
+      // process writes it (`dsh-storage-json`: "in-memory state is
+      // authoritative"), and the web app is normally the process holding it.
+      // An out-of-date TUI write would therefore revert every workspace edit
+      // the web committed since this TUI started — so we only add our own
+      // session while the medium still matches the registry we read.
+      if (workspaceMediumFingerprint() !== workspaceRegistryFingerprint(registry)) {
+        dbg(`工作区账本已被其它进程改写，跳过归属以免覆盖：${workspace.path}`)
         return
       }
       await workspace.attachSession(session.id)
@@ -3044,6 +3060,94 @@ function lastSessionFile(): string {
   if (override) return override
   const home = process.env['USERPROFILE'] ?? process.env['HOME'] ?? ''
   return join(home, '.dsh', 'orca-last-session.json')
+}
+
+/**
+ * The Workspace registry medium (`dsh-storage-json` single layout), at the
+ * path `dsh-home-paths` resolves: `$DSH_HOME/storages/workspace.json`, else
+ * `~/.dsh/storages/workspace.json`. `ORCA_WORKSPACE_FILE` is the test
+ * override — the smoke harness points it at a temp file, and a deployment
+ * with a relocated storage root simply never matches, which only disables the
+ * guard (and with it the attach).
+ */
+function workspaceMediumFile(): string {
+  const override = process.env['ORCA_WORKSPACE_FILE']
+  if (override) return override
+  const home = process.env['DSH_HOME']
+  if (home !== undefined && home !== '') return join(home, 'storages', 'workspace.json')
+  const profile = process.env['USERPROFILE'] ?? process.env['HOME'] ?? ''
+  return join(profile, '.dsh', 'storages', 'workspace.json')
+}
+
+/** Field separator for the fingerprints below: no legal JSON string holds it. */
+const FP_FIELD = '\u0001'
+const FP_ROW = '\u0002'
+
+/**
+ * Canonical fingerprint of the workspace DOCUMENT as the medium holds it now:
+ * registry order, each record's identity/stamp, and the archive set. Any
+ * unreadable, unrecognized, or partially-shaped document yields `null`, which
+ * the caller reads as "cannot verify" and therefore "do not write".
+ *
+ * This is a READ-ONLY guard against clobbering another process's workspace
+ * edits; Orca never writes this file itself (all writes go through
+ * `workspace.attachSession`, i.e. the kernel's own domain write chain).
+ */
+function workspaceMediumFingerprint(): string | null {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(readFileSync(workspaceMediumFile(), 'utf8'))
+  } catch {
+    return null
+  }
+  const document = recordOf(parsed)
+  const global = recordOf(document?.['global'])
+  const tables = recordOf(document?.['tables'])
+  const workspaces = recordOf(tables?.['workspaces'])
+  const order = global?.['workspaceIds']
+  const archived = global?.['archivedSessionIds']
+  if (workspaces === undefined || !Array.isArray(order) || !Array.isArray(archived)) return null
+  const rows: string[] = []
+  for (const id of order) {
+    if (typeof id !== 'string') return null
+    const record = recordOf(workspaces[id])
+    const path = record?.['path']
+    const title = record?.['title']
+    const updatedAt = record?.['updatedAt']
+    if (typeof path !== 'string' || typeof title !== 'string' || typeof updatedAt !== 'string') return null
+    rows.push([id, path, title, updatedAt].join(FP_FIELD))
+  }
+  for (const id of archived) {
+    if (typeof id !== 'string') return null
+  }
+  return `${rows.join(FP_ROW)}${FP_FIELD}${(archived as string[]).join(FP_ROW)}`
+}
+
+/**
+ * The same fingerprint built from the LIVE registry this process holds. A
+ * mismatch with {@link workspaceMediumFingerprint} means another writer
+ * committed after this process read the document.
+ */
+function workspaceRegistryFingerprint(registry: KernelWorkspaceRegistry): string | null {
+  let list: readonly KernelWorkspace[]
+  try {
+    list = registry.list()
+  } catch {
+    return null
+  }
+  const archived = registry.archivedSessionIds
+  const rows: string[] = []
+  for (const workspace of list) {
+    const { id, path, title, updatedAt } = workspace
+    if (typeof id !== 'string' || typeof path !== 'string' || typeof title !== 'string' || typeof updatedAt !== 'string') {
+      return null
+    }
+    rows.push([id, path, title, updatedAt].join(FP_FIELD))
+  }
+  if (archived !== undefined && !Array.isArray(archived)) return null
+  const archivedIds = (archived ?? []).filter((id): id is string => typeof id === 'string')
+  if (archived !== undefined && archivedIds.length !== archived.length) return null
+  return `${rows.join(FP_ROW)}${FP_FIELD}${archivedIds.join(FP_ROW)}`
 }
 
 interface LastSessionRecord {
