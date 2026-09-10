@@ -340,6 +340,8 @@ export class Channel {
   private openAssistantId: number | null = null
   private openThoughtId: number | null = null
   private readonly pendingTools = new Map<string, TranscriptRow>()
+  /** Audit pairing: `approval/asked` id → the tool it is about. */
+  private readonly approvalTools = new Map<string, string>()
   /**
    * True once a live model-stream delta reached this step. The durable
    * `assistant/message` then only RECONCILES the streamed text; without any
@@ -685,15 +687,29 @@ export class Channel {
         const data = dataOf(event)
         const tool = str(data, 'toolName') || 'tool'
         const reason = str(data, 'reason')
+        // `id` pairs the audit rows (the kernel guarantees one `decided` per
+        // `asked` inside a turn); without pairing, the result row of a
+        // parallel batch could not name its own tool.
+        const id = str(data, 'id')
+        if (id !== '') {
+          this.approvalTools.set(id, tool)
+          if (this.approvalTools.size > 50) {
+            const oldest = this.approvalTools.keys().next().value
+            if (oldest !== undefined) this.approvalTools.delete(oldest)
+          }
+        }
         this.pushSystem(`请求审批：${tool}${reason ? ` — ${preview(reason, 160)}` : ''}`)
         break
       }
       case 'approval/decided': {
         const data = dataOf(event)
+        const id = str(data, 'id')
+        const tool = id !== '' ? this.approvalTools.get(id) : undefined
+        if (id !== '') this.approvalTools.delete(id)
         const outcome = str(data, 'outcome')
         const label =
           outcome === 'allowed-once' ? '已放行（单次）' : outcome === 'rejected' ? '已拒绝' : outcome === 'cancelled' ? '已撤回' : '无应答者（已 fail-closed）'
-        this.pushSystem(`审批结果：${label}`)
+        this.pushSystem(`审批结果${tool === undefined ? '' : `（${tool}）`}：${label}`)
         break
       }
       case 'todo/write': {
@@ -817,6 +833,7 @@ export class Channel {
     this.openAssistantId = null
     this.openThoughtId = null
     this.pendingTools.clear()
+    this.approvalTools.clear()
     this.runState = 'idle'
     this.route = null
     this.usage = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, messages: 0 }
@@ -837,6 +854,16 @@ export class Channel {
   /** Replay a persisted log into this projection (resume without live events). */
   replay(events: readonly SessionEvent[]): void {
     for (const event of events) this.ingest(event)
+  }
+
+  /**
+   * The args preview of the still-running tool row for one call id — the
+   * approval panel shows WHAT is being approved, not just which tool
+   * (`approval/request` carries the `callId` for exactly this).
+   */
+  toolPreviewFor(callId: string): string | undefined {
+    const row = this.pendingTools.get(callId)
+    return row !== undefined && row.text !== '' ? row.text : undefined
   }
 
   /** Stamp the sealed duration onto the open thought row and close it. */

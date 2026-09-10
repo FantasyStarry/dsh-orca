@@ -601,6 +601,18 @@ try {
   await settle()
   assertInputBox('二次 Esc 后', '')
 
+  // ── step 3b: the menu must ALSO list kernel-registered commands ──
+  // `/goal` comes from @deepseek-ai/dsh-command-goal (dsh-base bundle) and is
+  // not in Orca's own table — seeing it proves the discovery seam works
+  // against the live kernel.
+  proc.write('/go')
+  await waitMarker('内核命令出现在菜单', /\/goal/)
+  await settle()
+  assertInputBox('输入 /go', '/go')
+  proc.write('\x1b')
+  await settle()
+  assertInputBox('内核命令菜单关闭后', '')
+
   // ── step 4: CJK typing keeps the cursor math honest ──
   proc.write('你好orca')
   await settle()

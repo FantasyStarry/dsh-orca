@@ -247,6 +247,10 @@ class FakeKernel implements KernelContext {
   hideSessionQuery = false
   /** When true, `agentPresets.mount` rejects (preset-failure fallback probe). */
   presetMountFails = false
+  /** Kernel-registered commands beyond Orca's own table (menu discovery probe). */
+  extraCommands: Array<{ readonly name: string; readonly description: string }> = [
+    { name: 'goal', description: '目标模式' },
+  ]
   /** Live agents by session id (removed on dispose, like the real store). */
   private readonly liveAgents = new Map<string, AgentHandle['agent']>()
   /** Sessions durable on "disk" (survive dispose, loadable via resume). */
@@ -333,7 +337,11 @@ class FakeKernel implements KernelContext {
     }
     if (name === 'commands') {
       return {
-        list: () => [{ name: 'compact', description: '压缩上下文' }],
+        list: () => [
+          { name: 'compact', description: '压缩上下文' },
+          // Not in Orca's own table: it must surface in the `/` menu.
+          ...this.extraCommands,
+        ],
         find: (_agent: unknown, cmdName: string) => (cmdName === 'compact' ? { name: 'compact' } : undefined),
         execute: async (_agent: unknown, line: string) => {
           this.record.compactLine = line
@@ -456,6 +464,14 @@ class FakeKernel implements KernelContext {
       ...(this.durable.get(sessionId) ?? []),
       ...this.logged.filter((entry) => entry.sessionId === sessionId).map((entry) => entry.event),
     ]
+  }
+
+  /**
+   * Publish one kernel-lifecycle cordis event (NOT a session event) — the
+   * shape `ctx.on(name, …)` listeners receive.
+   */
+  emitKernelEvent(name: string, ...args: unknown[]): void {
+    for (const listener of this.listeners.get(name) ?? []) listener(...args)
   }
 
   /**
@@ -1108,17 +1124,36 @@ async function main(): Promise<void> {
   if (!visible3().includes('Nerd Font 分支图标已开启')) problems.push('phase3：/nerdfont on 未上屏')
   await typeLine('/nerdfont off')
   if (!visible3().includes('Nerd Font 分支图标已关闭')) problems.push('phase3：/nerdfont off 未上屏')
-  // Panel path: the ask pends, the picker shows, `1` allows.
+  // Panel path: the ask pends, the picker shows, `1` allows. The ask carries
+  // the exact `callId`, so the panel quotes the pending tool call's arguments
+  // instead of asking the user to approve a bare tool name.
   {
     const listener = kernel3.record.approvalListener
     if (listener) {
-      const pending = listener({ toolName: 'edit', reason: '改文件' }, async () => 'rejected') as Promise<string>
+      kernel3.emit('tool/call', { turn: 1, step: 1, callId: 'call-approve', name: 'edit', arguments: '{"path":"src/app.ts"}' })
+      await sleep(60)
+      const pending = listener(
+        { toolName: 'edit', callId: 'call-approve', reason: '改文件' },
+        async () => 'rejected',
+      ) as Promise<string>
       await sleep(150)
       if (!visible3().includes('审批：edit')) problems.push('phase3：审批面板未上屏')
+      if (!visible3().includes('src/app.ts')) problems.push('phase3：审批面板未按 callId 引用工具调用参数')
       stdin3.text('1')
       await sleep(100)
       const outcome = await pending
       if (outcome !== 'allowed-once') problems.push(`phase3：面板按 1 未放行：${outcome}`)
+      // The decided tool row keeps its own id; the panel must not have eaten it.
+      kernel3.emit('tool/result', {
+        turn: 1,
+        step: 1,
+        message: { id: 'm1', role: 'user', content: [{ type: 'tool-result', toolCallId: 'call-approve', content: [{ type: 'text', text: 'done' }] }] },
+      })
+      await sleep(60)
+      // Close the turn: the following `/compact` is idle-gated, and a running
+      // tool row would (correctly) make it refuse.
+      kernel3.emit('turn/end', { turn: 1, reason: { kind: 'completed' } })
+      await sleep(60)
     }
   }
   // Esc on the panel rejects.
@@ -1166,6 +1201,9 @@ async function main(): Promise<void> {
   kernel3.emit('approval/decided', { id: 'a1', outcome: 'allowed-once' })
   await sleep(60)
   if (!visible3().includes('请求审批') || !visible3().includes('审批结果')) problems.push('phase3：approval 审计投影缺失')
+  // The audit pair is correlated by `id`: the result row names its own tool
+  // even when several asks are interleaved.
+  if (!visible3().includes('审批结果（write）')) problems.push('phase3：审批审计未按 id 配对')
   // /resume browser lists fake sessions with titles.
   for (const ch of '/resume') stdin3.text(ch)
   stdin3.key('return')
@@ -1254,6 +1292,34 @@ async function main(): Promise<void> {
   stdin4.key('return')
   await sleep(120)
   if (!visible4().includes('用量：')) problems.push('phase4：补全后回车未分发 /usage')
+  stdin4.key('escape')
+  await sleep(80)
+  // Kernel-registered commands join the same inline menu (dsh-commands).
+  for (const ch of '/g') stdin4.text(ch)
+  await sleep(120)
+  {
+    const snap = paintScreen(writes4, 24)
+    if (!snap.some((row) => row.includes('/goal'))) problems.push('phase4：/ 菜单未列入内核命令')
+    if (snap.some((row) => row.includes('/compact 压缩上下文'))) {
+      problems.push('phase4：本地同名命令应遮蔽内核命令')
+    }
+  }
+  stdin4.key('escape')
+  await sleep(80)
+  // `commands/change` must refresh the discovered list live.
+  kernel4.extraCommands = [
+    { name: 'goal', description: '目标模式' },
+    { name: 'schedule', description: '定时任务' },
+  ]
+  kernel4.emitKernelEvent('commands/change')
+  await sleep(80)
+  for (const ch of '/sch') stdin4.text(ch)
+  await sleep(120)
+  if (!paintScreen(writes4, 24).some((row) => row.includes('/schedule'))) {
+    problems.push('phase4：commands/change 未刷新菜单')
+  }
+  stdin4.key('escape')
+  await sleep(80)
   dispose4()
   await sleep(20)
 

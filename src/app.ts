@@ -43,6 +43,7 @@ import type {
   KernelAskUserQuestionAnswerItem,
   KernelAskUserQuestionRequest,
   KernelAttachmentStore,
+  KernelCommandDescriptor,
   KernelCommandsService,
   KernelContext,
   KernelFileReferenceService,
@@ -304,6 +305,8 @@ export function bootstrapApp(
 
   interface PendingApproval {
     readonly toolName: string
+    /** Exact tool call being decided, when the asker had one. */
+    readonly callId?: string
     readonly reason: string
     resolve: (outcome: 'allowed-once' | 'rejected' | 'cancelled') => void
     settled: boolean
@@ -317,8 +320,13 @@ export function bootstrapApp(
     // Approval is modal: it supersedes any picker (the model picker can be
     // reopened with /model after the decision).
     pickerStage = { kind: 'approval' }
+    // Show WHAT is being approved: the kernel hands us the exact `callId`, so
+    // the panel can quote the pending tool call's arguments instead of asking
+    // the user to approve a bare tool name.
+    const call = head.callId === undefined ? undefined : channel.toolPreviewFor(head.callId)
+    const detail = call !== undefined ? ` · ${call}` : head.reason !== '' ? ` — ${head.reason}` : ''
     picker = openPicker(
-      `审批：${head.toolName}${head.reason ? ` — ${head.reason}` : ''}`,
+      `审批：${head.toolName}${detail}`,
       [
         { value: 'allowed-once', label: '放行单次', hint: '1' },
         { value: 'rejected', label: '拒绝', hint: '2/Esc' },
@@ -341,6 +349,7 @@ export function bootstrapApp(
 
   const answerApproval = (
     toolName: string,
+    callId: string | undefined,
     reason: string,
     signal: AbortSignal | undefined,
   ): Promise<'allowed-once' | 'rejected' | 'cancelled'> => {
@@ -352,6 +361,7 @@ export function bootstrapApp(
     return new Promise<'allowed-once' | 'rejected' | 'cancelled'>((resolve) => {
       const entry: PendingApproval = {
         toolName: toolName === '' ? 'tool' : toolName,
+        ...(callId === undefined || callId === '' ? {} : { callId }),
         reason,
         resolve,
         settled: false,
@@ -968,6 +978,8 @@ export function bootstrapApp(
     const previous = handle
     handle = null
     agent = null
+    // The discovered command list belongs to the agent scope that is leaving.
+    kernelCommands = []
     while (approvalQueue.length > 0) settleApprovalHead('cancelled')
     for (const stop of agentListenerDisposers.splice(0)) stop()
     try {
@@ -1234,15 +1246,17 @@ export function bootstrapApp(
       const waterfallNext = typeof args[1] === 'function' ? (args[1] as () => Promise<string>) : undefined
       return (async (): Promise<string> => {
         let toolName = ''
+        let callId: string | undefined
         let reason = ''
         let signal: AbortSignal | undefined
         if (req) {
           if (typeof req['toolName'] === 'string') toolName = req['toolName']
+          if (typeof req['callId'] === 'string') callId = req['callId']
           if (typeof req['reason'] === 'string') reason = req['reason']
           if (req['signal'] instanceof AbortSignal) signal = req['signal']
         }
         try {
-          return await answerApproval(toolName, reason, signal)
+          return await answerApproval(toolName, callId, reason, signal)
         } catch {
           return 'rejected'
         } finally {
@@ -1296,6 +1310,9 @@ export function bootstrapApp(
       if (isStreamChunk(chunk)) channel.ingestStreamChunk(chunk as StreamChunk)
     })
     agentListenerDisposers.push(disposeStream)
+    // The registry is agent-scoped, so the command list is (re)discovered for
+    // every attached agent; `commands/change` keeps it fresh afterwards.
+    refreshKernelCommands()
   }
 
   // ── /model picker ─────────────────────────────────────────────────────────
@@ -1316,12 +1333,44 @@ export function bootstrapApp(
 
   let menuIndex = 0
 
+  /**
+   * Commands registered by kernel plugins (dsh-commands `ctx.commands`), e.g.
+   * `/compact`'s owner. Orca's own table shadows them by name, so the menu
+   * lists only what it cannot dispatch itself. Refreshed when the registry
+   * announces a change and whenever an agent is attached.
+   */
+  let kernelCommands: readonly KernelCommandDescriptor[] = []
+
+  const refreshKernelCommands = (): void => {
+    const registry = agent ? getCommands() : undefined
+    if (!registry || !agent) {
+      kernelCommands = []
+      return
+    }
+    try {
+      kernelCommands = registry.list(agent).filter((descriptor) => findSlash(descriptor.name) === undefined)
+    } catch {
+      // Discovery is best-effort; the local table stays usable.
+      kernelCommands = []
+    }
+  }
+
+  listenerDisposers.push(
+    ctx.on(KERNEL_EVENTS.commandsChange, () => {
+      refreshKernelCommands()
+    }),
+  )
+
   const menuMatches = (editorText: string): PickerItem[] => {
     if (!editorText.startsWith('/') || editorText.includes(' ')) return []
     const prefix = editorText.slice(1).toLowerCase()
-    return SLASH_COMMANDS.filter(
+    const local = SLASH_COMMANDS.filter(
       (cmd) => cmd.name.startsWith(prefix) || cmd.aliases.some((alias) => alias.startsWith(prefix)),
     ).map((cmd) => itemOf(`/${cmd.name}`, cmd.name, cmd.description))
+    const kernel = kernelCommands
+      .filter((descriptor) => descriptor.name.toLowerCase().startsWith(prefix))
+      .map((descriptor) => itemOf(`/${descriptor.name}`, descriptor.name, descriptor.description))
+    return [...local, ...kernel]
   }
 
   const currentMenu = (): { readonly items: readonly PickerItem[]; readonly index: number } | null => {
@@ -1336,10 +1385,11 @@ export function bootstrapApp(
     if (!menu || menu.items.length === 0) return false
     const item = menu.items[menu.index]
     if (!item) return false
-    editor = `/${item.value}`
-    // A completed slash command replaces the whole editor; inline image
-    // tokens must not survive into command dispatch.
-    pendingAttachments.length = 0
+    // Completing a command replaces the editor TEXT only: pending attachment
+    // tokens stay put (they belong to the next message, not to the command).
+    const kept = Array.from(editor).filter(isAttachmentSentinel)
+    editor = `/${item.value}${kept.join('')}`
+    cursorPos = codeLen(editor)
     menuIndex = 0
     return true
   }
