@@ -26,7 +26,7 @@ orca / dsh-orca   # 均等价于 dsh --profile orca
 ## 环境要求
 
 - Node.js `^22.19 || >=24`
-- [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) CLI（`@deepseek-ai/dsh`）
+- [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) CLI（`@deepseek-ai/dsh`）`0.1.5-rc.1`（接缝按此版本核对；更早/更新版本未验证）
 - pnpm（开发时）
 
 ## 安装
