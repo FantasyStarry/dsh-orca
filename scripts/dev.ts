@@ -321,7 +321,8 @@ class FakeKernel implements KernelContext {
   /** Live agents by session id (removed on dispose, like the real store). */
   private readonly liveAgents = new Map<string, AgentHandle['agent']>()
   /** Sessions durable on "disk" (survive dispose, loadable via resume). */
-  private readonly persistedSessions = new Set<string>()
+  /** Sessions `resume` accepts (public so a smoke case can seed one). */
+  readonly persistedSessions = new Set<string>()
 
   constructor(private readonly mounted: boolean) {}
 
@@ -2197,6 +2198,51 @@ async function main(): Promise<void> {
     )
     if (!adapterDefault.visible.includes('↳ 模型 ad-p/ad-m') || adapterDefault.visible.includes('ad-m(medium)')) {
       problems.push(`phase12：适配器默认 effort 被当成选型：${adapterDefault.visible.slice(-400)}`)
+    }
+
+    // (c) Resuming a session that records NO route at all must land on the
+    // composition default, NOT on this process's last pick: the kernel — and
+    // therefore the web — uses the default for such a log, so carrying a live
+    // pick in would make the two front doors disagree about the session.
+    {
+      const writes14: string[] = []
+      const stdin14 = new FakeStdin()
+      const kernel14 = new FakeKernel(true)
+      kernel14.persistedSessions.add('session-aaa') // the session the picker lists
+      const dispose14 = bootstrapApp(
+        kernel14,
+        { provider: '', model: '', fullscreen: false },
+        { stdout: () => makeStdout(writes14), stdin: () => stdin14 },
+      )
+      await sleep(300)
+      // 1) Pick a route: it becomes this process's live selection.
+      for (const ch of '/model') stdin14.text(ch)
+      stdin14.key('return')
+      await sleep(200)
+      stdin14.key('return') // provider fake-a
+      await sleep(200)
+      stdin14.key('return') // model fake-a-m1
+      await sleep(200)
+      stdin14.key('return') // effort（模型默认）
+      await sleep(300)
+      const flow14 = (): string => stripSgr(writes14.join(''))
+      if (!flow14().includes('fake-a/fake-a-m1')) problems.push('phase12：选型未生效（无记录会话回落用例）')
+      // 2) Resume a session whose durable log is EMPTY.
+      kernel14.resumeExtras = []
+      for (const ch of '/resume') stdin14.text(ch)
+      stdin14.key('return')
+      await sleep(500)
+      stdin14.key('return') // the picker's first item
+      await sleep(800)
+      const after14 = flow14().slice(flow14().lastIndexOf('↳ 模型'))
+      if (after14.includes('fake-a-m1')) {
+        problems.push(`phase12：上个会话的选型渗漏进了无路由记录的会话：${after14.slice(0, 200)}`)
+      }
+      if (!after14.includes('default-provider/default-model')) {
+        problems.push(`phase12：无路由记录的会话未回落到组合默认：${after14.slice(0, 200)}`)
+      }
+      dispose14()
+      await sleep(20)
     }
   }
 
