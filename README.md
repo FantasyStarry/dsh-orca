@@ -148,8 +148,8 @@ dsh-orca
 ```sh
 pnpm install
 pnpm build        # tsc → lib/
-pnpm test         # 生命周期 + 渲染回归测试
-pnpm dev          # 假内核冒烟测试
+pnpm test         # 生命周期 + 渲染回归 + 事件投影 + 选区/剪贴板（25 条）
+pnpm dev          # 假内核冒烟测试（12 个 phase）
 ```
 
 真实内核验证（在 `orca` profile 内，驱动真 PTY；`--features` / `--live` 各花一次最小 API 调用，`--state` 零调用）：
@@ -196,6 +196,10 @@ bin/
 scripts/
   paths.mjs           # 探针共用路径解析（dsh 安装 / 产物目录 / 工作目录）
   dev.ts              # 假内核冒烟 harness
+  lifecycle.test.ts   # 插件生命周期（装配/dispose/竞态）
+  render-regressions.ts # 帧构建回归（净化/宽字符/多行编辑/全屏滚动）
+  channel.test.ts     # session/event → 转录行投影
+  selection.test.ts   # 备用屏选区几何 + 剪贴板降级 + file:// 解析
   probe-pty.mjs       # 真 PTY 探针（--state / --features / --live）
   session-log.mjs     # 会话日志读取（zstd 多帧）
   inspect-session.mjs # 会话日志取证 CLI

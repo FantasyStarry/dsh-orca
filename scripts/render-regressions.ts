@@ -109,6 +109,48 @@ const tallVisible = visible(tallFrame.live)
 assert.match(tallVisible, /↑ \d+ 行/, '折叠时应在底边提示上方还有多少行')
 assert.ok(tallVisible.split('\n').length <= 24)
 
+// Multi-line + CJK: the editor soft-wraps by CELLS (a 2-cell glyph never
+// straddles the wrap point) and an inline attachment token still renders.
+const cjkEditor = buildFrame(context(cursorChannel, {
+  editorText: '中文中文中文',
+  editorCursor: 6,
+  fullscreen: false,
+  width: 24,
+}))
+const cjkRows = visible(cjkEditor.live).split('\n').filter((line) => line.includes('│'))
+assert.ok(cjkRows.some((line) => line.includes('中文')), '中文应正常渲染')
+for (const line of cjkRows) {
+  assert.ok(stringWidth(line) <= 24, `编辑框行不得超宽：${stringWidth(line)}`)
+}
+
+// Fullscreen scroll: the window is anchored ABSOLUTELY, so new output below
+// must not drag a pinned reading position.
+const longChannel = new Channel()
+for (let i = 0; i < 40; i++) longChannel.pushUser(`第 ${i} 行`)
+longChannel.sealedRowCount = longChannel.rows.length
+const tailFrame = buildFrame(context(longChannel, { fullscreen: true, height: 20 }))
+assert.ok(tailFrame.windowMaxTop > 0, '40 行内容在 20 行屏上必须溢出')
+assert.equal(tailFrame.windowTop, tailFrame.windowMaxTop, '默认跟随实时尾部')
+assert.match(visible(tailFrame.live), /上方还有 \d+ 行/)
+assert.equal(tailFrame.live.length, 20, 'fullscreen 帧必须恰好填满屏高')
+
+const pinned = tailFrame.windowTop - 4
+const scrolledFrame = buildFrame(context(longChannel, { fullscreen: true, height: 20, scrollTop: pinned }))
+assert.equal(scrolledFrame.windowTop, pinned)
+assert.match(visible(scrolledFrame.live), /下方 \d+ 行/, '上滚后应提示下方还有多少行')
+assert.equal(scrolledFrame.live.length, 20)
+
+longChannel.pushUser('新的一行')
+longChannel.sealedRowCount = longChannel.rows.length
+const afterGrowth = buildFrame(context(longChannel, { fullscreen: true, height: 20, scrollTop: pinned }))
+assert.equal(afterGrowth.windowTop, pinned, '新内容不得拖动已钉住的阅读位置')
+assert.ok(afterGrowth.windowMaxTop > tailFrame.windowMaxTop, '新增内容应扩大可滚动范围')
+
+// A scrollTop past the end clamps instead of rendering an empty window.
+const clamped = buildFrame(context(longChannel, { fullscreen: true, height: 20, scrollTop: 9_999 }))
+assert.equal(clamped.windowTop, clamped.windowMaxTop)
+assert.equal(clamped.live.length, 20)
+
 // The open row changes in place without touching seq. The next frame must
 // invalidate that row while reusing the immutable prefix.
 const mutable = new Channel()

@@ -32,9 +32,11 @@
 
 ```sh
 pnpm build
-pnpm dev   # 假内核冒烟：TTTY 渲染循环、键盘、降级启动
-pnpm test  # 生命周期 + 渲染回归
+pnpm dev   # 假内核冒烟：TTY 渲染循环、键盘、多行编辑、鼠标选区、降级启动
+pnpm test  # 生命周期 + 渲染回归 + 事件投影 + 选区几何/剪贴板
 ```
+
+改了内核接缝的投影就补 `scripts/channel.test.ts`，改了编辑器/选区几何就补 `scripts/render-regressions.ts` / `scripts/selection.test.ts`——**新增断言要做变异验证**（先把实现改坏，确认断言真的会红，再改回来）。
 
 涉及真实内核的改动，需在 profile 内实测：`dsh plugin --profile orca add .` → `dsh --profile orca`；能自动化的一律写进 `scripts/probe-pty.mjs`（真 ConPTY 驱动，`--state` 零 API 调用；`--features` / `--live` 各花一次最小调用），会话日志用 `scripts/inspect-session.mjs <session-id>` 取证。
 
