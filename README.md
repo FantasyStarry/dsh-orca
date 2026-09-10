@@ -14,7 +14,7 @@ orca / dsh-orca   # 均等价于 dsh --profile orca
 - 审批面板：逐次确认 / yolo 自动放行
 - `/model` 三段式切换 provider / model / 思考强度，并持久化默认
 - `/preset` 切换 Agent 预设
-- 图片输入：`/img`、`Ctrl+V` / `Alt+V` 粘贴图片，输入框内联 `[image #N]`，支持删除
+- 附件输入：`/img`（`/attach`）附加本地文件——图片走 `image` 块、其他文件走 `file` 块；`Ctrl+V` / `Alt+V` 粘贴图片，输入框内联 `[image #N]` / `[file #N]`，支持删除
 - `@` 文件补全
 - 待办列表：`/todo`
 - Agent 提问：支持官方 `ctx.userQuestions`，picker 单选/多选/自定义回答

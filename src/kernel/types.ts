@@ -752,9 +752,29 @@ export interface SaveImageAttachment {
   readonly name?: string
 }
 
+/** One non-image file handed to `saveFile` (dsh-attachment 0.1.5). */
+export interface SaveFileAttachment {
+  readonly data: Uint8Array
+  readonly name?: string
+}
+
+/** Structured attachment failure (dsh-attachment `AttachmentError`). */
+export interface KernelAttachmentError {
+  /** Stable code, e.g. `UNSUPPORTED_IMAGE_TYPE` / `IMAGE_TOO_LARGE`. */
+  readonly code: string
+}
+
 export interface KernelAttachmentStore {
   readonly imageLimits: KernelAttachmentLimits
   saveImage(input: SaveImageAttachment): Promise<ImageAttachmentRef>
+  /**
+   * Admit a non-image file and return its durable reference (dsh 0.1.5). The
+   * reference rides the user message as a `file` block. Optional: it degrades
+   * to "unsupported" on a kernel without the file path.
+   */
+  saveFile?(input: SaveFileAttachment): Promise<FileAttachmentRef>
+  /** Narrow an unknown rejection to a coded attachment error. Optional. */
+  isAttachmentError?(error: unknown): error is KernelAttachmentError
 }
 
 /**

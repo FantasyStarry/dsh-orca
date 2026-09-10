@@ -29,6 +29,7 @@ import type {
   AgentHandle,
   AgentScopedContext,
   ContentBlock,
+  FileAttachmentRef,
   FileReferenceCandidate,
   ImageAttachmentRef,
   ImageMediaType,
@@ -56,7 +57,7 @@ import type {
   UserMessage,
 } from './kernel/types.js'
 import { KERNEL_EVENTS } from './kernel/types.js'
-import { buildFrame, routeKey, routeLine, welcomeCard, IMAGE_SENTINEL } from './tui/chat.js'
+import { buildFrame, routeKey, routeLine, welcomeCard, IMAGE_SENTINEL, FILE_SENTINEL } from './tui/chat.js'
 import { classify, Keyboard } from './tui/input.js'
 import type { KeyPress } from './tui/input.js'
 import { openPicker, movePicker, pickedItem, togglePicker, type PickerItem, type PickerState } from './tui/picker.js'
@@ -115,7 +116,7 @@ const SLASH_COMMANDS: readonly SlashCommand[] = [
   { name: 'help', aliases: ['h', '?'], group: '信息', description: '显示命令帮助' },
   { name: 'model', aliases: [], group: '账号/配置', description: '切换模型（provider → 模型 → 思考强度）' },
   { name: 'preset', aliases: [], group: '会话', description: '查看/切换 Agent 预设（下个新会话生效）' },
-  { name: 'img', aliases: ['image'], group: '输入', description: '附加本地图片（/img <路径>，可多条，随下条消息发送）' },
+  { name: 'img', aliases: ['image', 'attach', 'file'], group: '输入', description: '附加本地文件（/img <路径>；图片走 image 块，其他走 file 块）' },
   { name: 'new', aliases: ['clear'], group: '会话', description: '丢弃当前上下文，开新会话' },
   { name: 'resume', aliases: ['sessions'], group: '会话', description: '浏览并恢复历史会话' },
   { name: 'title', aliases: ['rename'], group: '会话', description: '查看或设置会话标题' },
@@ -422,7 +423,11 @@ export function bootstrapApp(
     }),
   )
 
-  const submit = (text: string, images: readonly ImageAttachmentRef[] = []): void => {
+  const submit = (
+    text: string,
+    images: readonly ImageAttachmentRef[] = [],
+    files: readonly FileAttachmentRef[] = [],
+  ): void => {
     const slash = parseSlash(text.trim())
     if (slash) {
       const cmd = findSlash(slash.name)
@@ -436,9 +441,13 @@ export function bootstrapApp(
         dispatchSlash(cmd.name, slash.args)
         return
       }
-      // Unknown slash: try the kernel-owned registry (e.g. future commands
-      // registered by plugins). Admission misses resolve to undefined and
-      // fall through to a normal prompt — the kimi behavior.
+      // Unknown slash: try the kernel-owned registry (e.g. commands
+      // registered by plugins, including /compact's owner). Admission misses
+      // resolve to undefined and fall through to a normal prompt — the kimi
+      // behavior. Attachments are NOT forwarded: `CommandSubmitAttachment`
+      // wants either base64 image bytes (we hold durable refs) or a STAGED
+      // file receipt minted by the session upload owner, which an out-of-tree
+      // TUI has no way to obtain. A miss therefore re-sends them as a prompt.
       const registry = agent ? getCommands() : undefined
       if (agent && registry) {
         const line = text.trim()
@@ -446,7 +455,9 @@ export function bootstrapApp(
           try {
             const execution = await registry.execute(agent, line, [], new AbortController().signal)
             if (execution === undefined) {
-              agent.followup(buildUserMessage(text))
+              agent.followup(buildUserMessage(text, images, files))
+            } else if (files.length > 0 || images.length > 0) {
+              channel.pushSystem('提示：内核命令不接收 Orca 的附件，本条命令未附带附件')
             }
           } catch (error) {
             channel.pushSystem(`命令执行失败：${error instanceof Error ? error.message : String(error)}`)
@@ -463,16 +474,23 @@ export function bootstrapApp(
     // A lone image path (drag-drop fallback for terminals without bracketed
     // paste) attaches instead of sending the path as a prompt. Strip quotes
     // for the existence check but keep the original for attachment (it knows
-    // how to handle quoted paths with spaces).
+    // how to handle quoted paths with spaces). Deliberately IMAGE-only:
+    // auto-attaching any existing path would hijack ordinary prompts such as
+    // "README.md" — non-image files need the explicit `/img` (`/attach`).
     const rawPath = text.trim()
     const unquotedPath = rawPath.replace(/^"|"$/g, '').trim()
-    if (images.length === 0 && looksLikeImagePath(rawPath) && existsSync(resolvePath(unquotedPath))) {
+    if (
+      images.length === 0 &&
+      files.length === 0 &&
+      looksLikeImagePath(rawPath) &&
+      existsSync(resolvePath(unquotedPath))
+    ) {
       void attachImageFile(rawPath)
       return
     }
     // No optimistic echo: the user row is projected from the kernel's
     // `user/message` event, so the transcript stays a pure log projection.
-    agent.followup(buildUserMessage(text, images))
+    agent.followup(buildUserMessage(text, images, files))
   }
 
   const dispatchSlash = (name: string, args: string): void => {
@@ -615,7 +633,7 @@ export function bootstrapApp(
   const doImage = async (args: string): Promise<void> => {
     const path = args.trim()
     if (path === '') {
-      channel.pushSystem('用法：/img <图片路径>（png/jpg/webp/gif；可多次附加，随下一条消息发送）')
+      channel.pushSystem('用法：/img <路径>（图片走 image 块，其他文件走 file 块；可多次附加，随下一条消息发送）')
       return
     }
     await attachImageFile(path)
@@ -1321,7 +1339,7 @@ export function bootstrapApp(
     editor = `/${item.value}`
     // A completed slash command replaces the whole editor; inline image
     // tokens must not survive into command dispatch.
-    pendingImages.length = 0
+    pendingAttachments.length = 0
     menuIndex = 0
     return true
   }
@@ -1812,8 +1830,21 @@ export function bootstrapApp(
   /** Submitted prompts (slash commands excluded) — ↑ recalls, ↓ returns. */
   const promptHistory: string[] = []
   let historyIndex: number | null = null
-  /** Pending image attachments — durable refs attached to the NEXT message. */
-  const pendingImages: { readonly ref: ImageAttachmentRef; readonly label: string }[] = []
+  /**
+   * Pending attachments for the NEXT message: durable refs, in the order
+   * their inline tokens appear. The kernel's only attachment kinds are
+   * `image` (raster, dsh-llm `ImageBlock`) and `file` (everything else,
+   * dsh-llm `FileBlock`, 0.1.5).
+   */
+  type PendingAttachment =
+    | { readonly kind: 'image'; readonly ref: ImageAttachmentRef; readonly label: string }
+    | { readonly kind: 'file'; readonly ref: FileAttachmentRef; readonly label: string }
+
+  const pendingAttachments: PendingAttachment[] = []
+
+  const imageCount = (): number => pendingAttachments.filter((item) => item.kind === 'image').length
+  const imageBytes = (): number =>
+    pendingAttachments.reduce((sum, item) => (item.kind === 'image' ? sum + item.ref.bytes : sum), 0)
   /** Active `@path` completion menu (kernel `fileReferences` or local fallback). */
   let atMenu: PickerState | null = null
   const atCandidates: FileReferenceCandidate[] = []
@@ -1830,61 +1861,88 @@ export function bootstrapApp(
   let atDoneQuery: string | null = null
 
   // ── editor helpers (code-point based; cursor is an index into chars) ──────
-  // Image attachments are inline IMAGE_SENTINEL chars. They render as
-  // `[image #N]` in chat.ts and are atomic for editing: backspace/delete
-  // remove the whole token and the matching pending image.
+  // Attachments are inline sentinel chars (IMAGE_SENTINEL / FILE_SENTINEL).
+  // They render as `[image #N]` / `[file #N]` in chat.ts and are atomic for
+  // editing: backspace/delete remove the whole token and the matching pending
+  // attachment. Each sentinel counts only its OWN kind, in document order, so
+  // the editor and `pendingAttachments` can never drift apart.
 
   const codeLen = (text: string): number => Array.from(text).length
 
-  /** Count image sentinels in chars[0..pos). */
-  const imageIndexBefore = (chars: readonly string[], pos: number): number => {
+  const isAttachmentSentinel = (ch: string): boolean => ch === IMAGE_SENTINEL || ch === FILE_SENTINEL
+
+  /** Index of this sentinel within its own kind, among chars[0..pos). */
+  const kindIndexBefore = (chars: readonly string[], pos: number, sentinel: string): number => {
     let n = 0
-    for (let i = 0; i < pos; i++) if (chars[i] === IMAGE_SENTINEL) n++
+    for (let i = 0; i < pos; i++) if (chars[i] === sentinel) n++
     return n
   }
 
-  /** Remove pending images whose sentinels lie in chars[start..end). */
-  const removePendingImagesInRange = (chars: readonly string[], start: number, end: number): void => {
-    const indexes: number[] = []
-    for (let i = start; i < end; i++) {
-      if ((chars[i] ?? '') === IMAGE_SENTINEL) indexes.push(imageIndexBefore(chars, i))
+  /** Position of one (kind, kindIndex) pair inside `pendingAttachments`. */
+  const pendingIndexOf = (kind: 'image' | 'file', kindIndex: number): number => {
+    let seen = 0
+    for (let i = 0; i < pendingAttachments.length; i++) {
+      if (pendingAttachments[i]?.kind !== kind) continue
+      if (seen === kindIndex) return i
+      seen++
     }
-    indexes.sort((a, b) => b - a)
-    for (const index of indexes) {
-      if (index >= 0 && index < pendingImages.length) pendingImages.splice(index, 1)
-    }
+    return -1
   }
 
-  /** Insert one inline image token at the cursor (call after pendingImages.push). */
-  const insertImageToken = (): void => {
+  /** Remove pending attachments whose sentinels lie in chars[start..end). */
+  const removePendingAttachmentsInRange = (chars: readonly string[], start: number, end: number): void => {
+    const indexes: number[] = []
+    for (let i = start; i < end; i++) {
+      const ch = chars[i] ?? ''
+      if (!isAttachmentSentinel(ch)) continue
+      const kind = ch === IMAGE_SENTINEL ? 'image' : 'file'
+      const index = pendingIndexOf(kind, kindIndexBefore(chars, i, ch))
+      if (index !== -1) indexes.push(index)
+    }
+    indexes.sort((a, b) => b - a)
+    for (const index of indexes) pendingAttachments.splice(index, 1)
+  }
+
+  /** Insert one inline attachment token at the cursor (call after the push). */
+  const insertAttachmentToken = (kind: 'image' | 'file'): void => {
     const chars = Array.from(editor)
-    chars.splice(cursorPos, 0, IMAGE_SENTINEL)
+    chars.splice(cursorPos, 0, kind === 'image' ? IMAGE_SENTINEL : FILE_SENTINEL)
     editor = chars.join('')
     cursorPos += 1
     scheduleAtFetch()
   }
 
-  /** Split editor into plain text + ordered image refs for submission. */
-  const collectSubmission = (): { readonly text: string; readonly images: ImageAttachmentRef[] } => {
+  /** Split editor into plain text + ordered attachment refs for submission. */
+  const collectSubmission = (): {
+    readonly text: string
+    readonly images: ImageAttachmentRef[]
+    readonly files: FileAttachmentRef[]
+  } => {
     const chars = Array.from(editor)
     let text = ''
     const images: ImageAttachmentRef[] = []
+    const files: FileAttachmentRef[] = []
     let imageIndex = 0
+    let fileIndex = 0
     for (const ch of chars) {
       if (ch === IMAGE_SENTINEL) {
-        const ref = pendingImages[imageIndex]?.ref
-        if (ref) images.push(ref)
+        const item = pendingAttachments[pendingIndexOf('image', imageIndex)]
+        if (item?.kind === 'image') images.push(item.ref)
         imageIndex++
+      } else if (ch === FILE_SENTINEL) {
+        const item = pendingAttachments[pendingIndexOf('file', fileIndex)]
+        if (item?.kind === 'file') files.push(item.ref)
+        fileIndex++
       } else {
         text += ch
       }
     }
-    return { text: text.trim(), images }
+    return { text: text.trim(), images, files }
   }
 
   /** Insert text at the cursor; folded pasted newlines stay single-line. */
   const insertText = (seq: string): void => {
-    const clean = seq.replace(/\r\n?/g, ' ').replaceAll(IMAGE_SENTINEL, '')
+    const clean = seq.replace(/\r\n?/g, ' ').replace(/[\uE000\uE001]/g, '')
     if (clean === '') return
     const chars = Array.from(editor)
     const ins = Array.from(clean)
@@ -1903,7 +1961,7 @@ export function bootstrapApp(
       while (from > 0 && (chars[from] ?? '') === ' ') from--
       while (from > 0 && (chars[from - 1] ?? '') !== ' ') from--
     }
-    removePendingImagesInRange(chars, from, cursorPos)
+    removePendingAttachmentsInRange(chars, from, cursorPos)
     editor = [...chars.slice(0, from), ...chars.slice(cursorPos)].join('')
     cursorPos = from
     scheduleAtFetch()
@@ -1912,14 +1970,14 @@ export function bootstrapApp(
   const deleteAt = (): void => {
     const chars = Array.from(editor)
     if (cursorPos >= chars.length) return
-    removePendingImagesInRange(chars, cursorPos, cursorPos + 1)
+    removePendingAttachmentsInRange(chars, cursorPos, cursorPos + 1)
     editor = [...chars.slice(0, cursorPos), ...chars.slice(cursorPos + 1)].join('')
     scheduleAtFetch()
   }
 
   const killToStart = (): void => {
     const chars = Array.from(editor)
-    removePendingImagesInRange(chars, 0, cursorPos)
+    removePendingAttachmentsInRange(chars, 0, cursorPos)
     editor = chars.slice(cursorPos).join('')
     cursorPos = 0
     scheduleAtFetch()
@@ -1927,7 +1985,7 @@ export function bootstrapApp(
 
   const killToEnd = (): void => {
     const chars = Array.from(editor)
-    removePendingImagesInRange(chars, cursorPos, chars.length)
+    removePendingAttachmentsInRange(chars, cursorPos, chars.length)
     editor = chars.slice(0, cursorPos).join('')
     scheduleAtFetch()
   }
@@ -2096,7 +2154,7 @@ export function bootstrapApp(
     }
     const mention = Array.from(formatFileMention(candidate))
     const chars = Array.from(editor)
-    removePendingImagesInRange(chars, token.start, cursorPos)
+    removePendingAttachmentsInRange(chars, token.start, cursorPos)
     editor = [...chars.slice(0, token.start), ...mention, ...chars.slice(cursorPos)].join('')
     cursorPos = token.start + mention.length
     atMenu = null
@@ -2109,14 +2167,28 @@ export function bootstrapApp(
     return true
   }
 
-  /** Clear the editor state (Esc): text, cursor, menus, pending images. */
+  /** Clear the editor state (Esc): text, cursor, menus, pending attachments. */
   const resetEditor = (): void => {
     editor = ''
     cursorPos = 0
     menuIndex = 0
     atMenu = null
     historyIndex = null
-    pendingImages.length = 0
+    pendingAttachments.length = 0
+  }
+
+  /**
+   * Drop the editor's TEXT but keep its attachment tokens (and the pending
+   * refs they stand for). Used when a slash command consumes the line: the
+   * attachments belong to the next message, not to the command.
+   */
+  const clearEditorText = (): void => {
+    const kept = Array.from(editor).filter(isAttachmentSentinel)
+    editor = kept.join('')
+    cursorPos = kept.length
+    menuIndex = 0
+    atMenu = null
+    historyIndex = null
   }
 
   // ── prompt history recall (↑ on an empty editor) ──────────────────────────
@@ -2133,7 +2205,7 @@ export function bootstrapApp(
         historyIndex = null
         editor = ''
         cursorPos = 0
-        pendingImages.length = 0
+        pendingAttachments.length = 0
         return
       }
       historyIndex = next
@@ -2142,8 +2214,8 @@ export function bootstrapApp(
     editor = entry ?? ''
     cursorPos = codeLen(editor)
     // History entries are text-only; drop any inline image tokens that were
-    // pending so the editor and pendingImages never drift apart.
-    pendingImages.length = 0
+    // pending so the editor and pendingAttachments never drift apart.
+    pendingAttachments.length = 0
     menuIndex = 0
   }
   // ── image attachments (kernel `attachments` seam, dsh-attachment) ─────────
@@ -2185,42 +2257,76 @@ export function bootstrapApp(
     return isAbsolute(expanded) ? expanded : resolve(process.cwd(), expanded)
   }
 
-  /** Read, admit, and durably store one image; it rides the NEXT message. */
+  /** Read, admit, and durably store one attachment; it rides the NEXT message. */
   const attachImageFile = async (rawPath: string): Promise<void> => {
     const attachments = getAttachments()
     if (!attachments) {
-      channel.pushSystem('attachments 服务未挂载：无法附加图片（内核需挂载 dsh-attachment-local）')
+      channel.pushSystem('attachments 服务未挂载：无法附加文件（内核需挂载 dsh-attachment-local）')
       return
     }
     const abs = resolvePath(rawPath.replace(/^"|"$/g, '').trim())
-    const mediaType = imageMediaTypeOf(abs)
-    if (!mediaType) {
-      channel.pushSystem(`不支持的图片格式：${basename(abs)}（支持 png/jpg/webp/gif）`)
-      return
-    }
     let data: Buffer
     try {
       data = readFileSync(abs)
     } catch (error) {
-      channel.pushSystem(`读取图片失败：${basename(abs)}（${error instanceof Error ? error.message : String(error)}）`)
+      channel.pushSystem(`读取失败：${basename(abs)}（${error instanceof Error ? error.message : String(error)}）`)
       return
     }
+    const name = basename(abs)
+    const mediaType = imageMediaTypeOf(abs)
     const limits = attachments.imageLimits
-    if (data.length > limits.maxImageBytes) {
-      channel.pushSystem(`图片过大：${basename(abs)} 超出单图上限（${Math.round(limits.maxImageBytes / 1048576)} MiB）`)
+    // An image is admitted only when this deployment accepts its media type:
+    // the kernel's own `mediaTypes` list is the authority, not our extension
+    // table (a narrowed deployment must not fail later at saveImage).
+    if (mediaType && !limits.mediaTypes.includes(mediaType)) {
+      channel.pushSystem(`该部署不接受 ${mediaType} 图片：${name}（可接受：${limits.mediaTypes.join('/') || '无'}）`)
       return
     }
-    if (pendingImages.length >= limits.maxImagesPerMessage) {
-      channel.pushSystem(`图片数量已达上限（${limits.maxImagesPerMessage}）`)
+    if (mediaType) {
+      const pendingBytes = imageBytes()
+      if (data.length > limits.maxImageBytes) {
+        channel.pushSystem(`图片过大：${name} 超出单图上限（${Math.round(limits.maxImageBytes / 1048576)} MiB）`)
+        return
+      }
+      if (imageCount() >= limits.maxImagesPerMessage) {
+        channel.pushSystem(`图片数量已达上限（${limits.maxImagesPerMessage}）`)
+        return
+      }
+      // The per-image cap cannot catch the AGGREGATE limit; enforce it here so
+      // the batch can never exceed what the kernel would accept at admission.
+      if (pendingBytes + data.length > limits.maxMessageImageBytes) {
+        channel.pushSystem(
+          `本条消息的图片总量将超出上限（${Math.round(limits.maxMessageImageBytes / 1048576)} MiB）：${name}`,
+        )
+        return
+      }
+    } else if (!attachments.saveFile) {
+      channel.pushSystem(`内核未提供文件附件通路：${name}（需 dsh-attachment ≥ 0.1.5，或用图片格式）`)
       return
     }
     try {
-      const ref = await attachments.saveImage({ data: new Uint8Array(data), mediaType, name: basename(abs) })
-      pendingImages.push({ ref, label: ref.name ?? basename(abs) })
-      insertImageToken()
+      if (mediaType) {
+        const ref = await attachments.saveImage({ data: new Uint8Array(data), mediaType, name })
+        pendingAttachments.push({ kind: 'image', ref, label: ref.name ?? name })
+      } else {
+        const ref = await attachments.saveFile!({ data: new Uint8Array(data), name })
+        pendingAttachments.push({ kind: 'file', ref, label: ref.name || name })
+      }
+      insertAttachmentToken(mediaType ? 'image' : 'file')
     } catch (error) {
-      channel.pushSystem(`图片附加失败：${error instanceof Error ? error.message : String(error)}`)
+      channel.pushSystem(`${mediaType ? '图片' : '文件'}附加失败：${attachmentErrorText(attachments, error)}`)
     }
+  }
+
+  /** Human-readable failure: the kernel's stable code when it is an AttachmentError. */
+  const attachmentErrorText = (attachments: KernelAttachmentStore, error: unknown): string => {
+    const detail = error instanceof Error ? error.message : String(error)
+    try {
+      if (attachments.isAttachmentError?.(error)) return `${error.code}（${detail}）`
+    } catch {
+      // Fall through to the raw message.
+    }
+    return detail
   }
 
   /**
@@ -2332,7 +2438,7 @@ export function bootstrapApp(
           // Double-Ctrl+C exits; the first press interrupts a running turn
           // or clears editor state, and never kills the session by accident.
           const now = Date.now()
-          const idleAndClean = editor === '' && cursorPos === 0 && pendingImages.length === 0 && channel.runState === 'idle'
+          const idleAndClean = editor === '' && cursorPos === 0 && pendingAttachments.length === 0 && channel.runState === 'idle'
           if (now - lastExitAt < 1200 || idleAndClean) {
             const exit = ctx.get<KernelAppExit>('appExit', false)
             if (typeof exit === 'function') exit(0)
@@ -2351,7 +2457,7 @@ export function bootstrapApp(
             resetEditor()
             break
           }
-          if (editor || cursorPos !== 0 || pendingImages.length > 0) {
+          if (editor || cursorPos !== 0 || pendingAttachments.length > 0) {
             resetEditor()
             break
           }
@@ -2387,7 +2493,7 @@ export function bootstrapApp(
           }
           // A visible @ menu completes first; Enter never submits through it.
           if (completeAt()) break
-          const { text: submitted, images } = collectSubmission()
+          const { text: submitted, images, files } = collectSubmission()
           const text = submitted
           // Partial slash input completes from the menu first (kimi behavior);
           // a second Enter dispatches the completed command.
@@ -2397,17 +2503,28 @@ export function bootstrapApp(
               if (completeMenu()) break
             }
           }
-          // Detach the pending images BEFORE resetEditor wipes them — the
-          // refs must ride THIS message, and Esc-cancel still clears the
+          // A known slash command consumes only its own line: pending
+          // attachments stay attached to the NEXT message (kimi behavior).
+          // Wiping them here used to make `/img a.png` followed by
+          // `/img b.pdf` silently drop the first file.
+          const ownCommand = text.startsWith('/') ? findSlash(parseSlash(text)?.name ?? '') : undefined
+          if (ownCommand) {
+            clearEditorText()
+            historyIndex = null
+            submit(text, [], [])
+            break
+          }
+          // Detach the pending attachments BEFORE resetEditor wipes them —
+          // the refs must ride THIS message, and Esc-cancel still clears the
           // rest of the editor state.
           resetEditor()
           historyIndex = null
-          if (submitted || images.length > 0) {
+          if (submitted || images.length > 0 || files.length > 0) {
             if (submitted && !submitted.startsWith('/')) {
               promptHistory.push(submitted)
               if (promptHistory.length > 100) promptHistory.shift()
             }
-            submit(submitted, images)
+            submit(submitted, images, files)
           }
           break
         }
@@ -2631,10 +2748,15 @@ function mintSessionId(): string {
  * compile-time only. Pending images ride as durable `image` blocks after the
  * text block (dsh-llm `ImageBlock`).
  */
-function buildUserMessage(text: string, images: readonly ImageAttachmentRef[] = []): UserMessage {
+function buildUserMessage(
+  text: string,
+  images: readonly ImageAttachmentRef[] = [],
+  files: readonly FileAttachmentRef[] = [],
+): UserMessage {
   const content: ContentBlock[] = []
-  if (text !== '' || images.length === 0) content.push({ type: 'text', text })
+  if (text !== '' || (images.length === 0 && files.length === 0)) content.push({ type: 'text', text })
   for (const attachment of images) content.push({ type: 'image', attachment })
+  for (const attachment of files) content.push({ type: 'file', attachment })
   return {
     id: `msg-${randomUUID()}`,
     role: 'user',

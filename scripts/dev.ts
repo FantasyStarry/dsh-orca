@@ -242,6 +242,7 @@ class FakeKernel implements KernelContext {
   private fakePolicy = 'ask'
   private fakeTitle: string | null = null
   private attachmentSeq = 0
+  private fileSeq = 0
   /** When true, `sessionQuery` reads as unregistered (late-registration probe). */
   hideSessionQuery = false
   /** When true, `agentPresets.mount` rejects (preset-failure fallback probe). */
@@ -366,6 +367,7 @@ class FakeKernel implements KernelContext {
           maxImageBytes: 20 * 1048576,
           maxImagesPerMessage: 20,
           maxMessageImageBytes: 200 * 1048576,
+          maxImagePixels: 64_000_000,
           maxImageDimension: 8192,
           mediaTypes: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'],
         },
@@ -380,6 +382,13 @@ class FakeKernel implements KernelContext {
             name: input.name,
           }
         },
+        // dsh-attachment 0.1.5 file path (non-image attachments).
+        saveFile: async (input: { data: Uint8Array; name?: string }) => {
+          this.fileSeq++
+          return { attachmentId: `file-${this.fileSeq}`, name: input.name ?? 'file', bytes: input.data.length }
+        },
+        isAttachmentError: (error: unknown): error is { readonly code: string } =>
+          typeof error === 'object' && error !== null && typeof (error as { code?: unknown }).code === 'string',
       } as T
     }
     if (name === 'agentPresets') {
@@ -1392,6 +1401,21 @@ async function main(): Promise<void> {
         problems.push(`phase8：@ 补全未按候选完成：${JSON.stringify(kernel8.record.followupMessage ?? null)}`)
       }
     }
+    // A non-image file rides the same path but becomes a `file` block
+    // (dsh-attachment 0.1.5) with its own inline token and its own counter.
+    // Attached FIRST: dispatching a slash command resets the editor, so a
+    // command line can never be typed while other attachments are pending.
+    const txtPath = join(tmpdir(), `orca-smoke-${process.pid}.txt`)
+    writeFileSync(txtPath, 'hello file')
+    for (const ch of `/img ${txtPath}`) stdin8.text(ch)
+    stdin8.key('return')
+    await sleep(300)
+    {
+      const screen = paintScreen(rw, 24).join('\n')
+      if (!screen.includes('[file #1]')) {
+        problems.push(`phase8：文件附件徽标未渲染：${screen.split('\n').find((row) => row.includes('│ >')) ?? ''}`)
+      }
+    }
     // /img attaches a durable image; bracketed paste of an image path does too.
     const pngPath = join(tmpdir(), `orca-smoke-${process.pid}.png`)
     writeFileSync(pngPath, Buffer.from([0x89, 0x50, 0x4e, 0x47])) // header-only; the fake store skips decode
@@ -1401,9 +1425,12 @@ async function main(): Promise<void> {
     stdin8.paste(pngPath)
     await sleep(400)
     {
-      // Images are inline Claude Code style tokens inside the editor.
+      // Attachments are inline Claude Code style tokens inside the editor,
+      // each kind numbering itself.
       const screen = paintScreen(rw, 24).join('\n')
-      if (!screen.includes('[image #1] [image #2]')) problems.push('phase8：内联图片徽标未在输入框内渲染')
+      if (!screen.includes('[file #1] [image #1] [image #2]')) {
+        problems.push('phase8：内联附件徽标未在输入框内渲染')
+      }
     }
     // Backspace removes the last inline image token (atomic delete).
     stdin8.key('backspace')
@@ -1418,7 +1445,7 @@ async function main(): Promise<void> {
     await sleep(400)
     {
       const screen = paintScreen(rw, 24).join('\n')
-      if (!screen.includes('[image #1] [image #2]')) problems.push('phase8：重新附加后内联图片未恢复为两张')
+      if (!screen.includes('[file #1] [image #1] [image #2]')) problems.push('phase8：重新附加后内联图片未恢复为两张')
     }
     for (const ch of '看看图') stdin8.text(ch)
     stdin8.key('return')
@@ -1433,7 +1460,11 @@ async function main(): Promise<void> {
         problems.push(`phase8：图片块未随消息发送：${JSON.stringify(image ?? null)}`)
       }
       if (blocks[2]?.type !== 'image') problems.push('phase8：第二张图片块缺失')
-      if (!stripSgr(rw.join('')).includes('[image #1] [image #2]')) problems.push('phase8：user/message 图片投影缺失')
+      const file = blocks[3]
+      if (file?.type !== 'file' || file.attachment.name.endsWith('.txt') !== true) {
+        problems.push(`phase8：文件块未随消息发送：${JSON.stringify(file ?? null)}`)
+      }
+      if (!stripSgr(rw.join('')).includes('[image #1] [image #2] [file #1]')) problems.push('phase8：user/message 附件投影缺失')
     }
     // ↑ on an empty editor recalls the last prompt; submitting again is image-free.
     stdin8.key('up')

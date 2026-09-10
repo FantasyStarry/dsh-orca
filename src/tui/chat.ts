@@ -117,6 +117,21 @@ export interface ChatFrame {
 
 export const IMAGE_SENTINEL = ''
 
+/**
+ * Inline file-attachment token (dsh-llm `FileBlock`). A distinct codepoint
+ * from {@link IMAGE_SENTINEL} so the editor, the pending list and the frame
+ * builder all agree on the kind without extra plumbing: each sentinel counts
+ * only its own kind, in document order.
+ */
+export const FILE_SENTINEL = ''
+
+/** Visible label of one attachment token, or undefined for an ordinary char. */
+function attachmentToken(ch: string, kindIndex: number): string | undefined {
+  if (ch === IMAGE_SENTINEL) return `[image #${kindIndex}] `
+  if (ch === FILE_SENTINEL) return `[file #${kindIndex}] `
+  return undefined
+}
+
 const HINT = 'Enter 发送 · /model · @文件 · Ctrl+V/Alt+V 图片 · Ctrl+O 思考 · Esc 取消 · Ctrl+C 退出'
 
 /** Orca brand role bullet: `🐋` is 2 cells + 1 space, so both our cell math
@@ -697,19 +712,23 @@ function wrappedLines(text: string, width: number): string[] {
  */
 /**
  * Boxed editor, kimi-style: primary rounded frame, `> ` prompt at column 2.
- * Pending image attachments render as rows inside the box above the prompt;
+/**
+ * Pending attachment tokens render as inline labels inside the input box;
  * a mid-text logical cursor highlights the char under it (reverse video).
  */
-function expandImageTokens(text: string): string {
+function expandAttachmentTokens(text: string): string {
   let out = ''
-  let n = 0
+  let images = 0
+  let files = 0
   for (const ch of Array.from(text)) {
-    if (ch === IMAGE_SENTINEL) {
-      n++
+    let label: string | undefined
+    if (ch === IMAGE_SENTINEL) label = attachmentToken(ch, ++images)
+    else if (ch === FILE_SENTINEL) label = attachmentToken(ch, ++files)
+    if (label !== undefined) {
       // Display-only trailing space keeps multiple tokens readable without
       // putting a real space in the raw editor (so Backspace deletes the
       // whole token atomically).
-      out += `[image #${n}] `
+      out += label
     } else {
       out += ch
     }
@@ -731,18 +750,20 @@ function inputBox(
   for (const label of attachments ?? []) rows.push(boxLine('🖼 ' + cleanLine(label), w, style))
   const sourceChars = Array.from(text)
   const sourceIndex = Math.max(0, Math.min(sourceChars.length, cursor ?? sourceChars.length))
-  const cleaned = cleanLine(expandImageTokens(text))
-  // Build the visible line directly from raw chars: only real IMAGE_SENTINEL
-  // tokens are highlighted, so manually typed `[image #1]` text stays plain.
+  const cleaned = cleanLine(expandAttachmentTokens(text))
+  // Build the visible line directly from raw chars: only real sentinel tokens
+  // are highlighted, so manually typed `[image #1]` text stays plain.
   let body = ''
   let displayIndex = 0
   let imageNumber = 0
+  let fileNumber = 0
   for (let i = 0; i < sourceChars.length; i++) {
     const ch = sourceChars[i] ?? ''
-    if (ch === IMAGE_SENTINEL) {
-      imageNumber++
-      const token = `[image #${imageNumber}] `
-      const tokenChars = Array.from(token)
+    let label: string | undefined
+    if (ch === IMAGE_SENTINEL) label = attachmentToken(ch, ++imageNumber)
+    else if (ch === FILE_SENTINEL) label = attachmentToken(ch, ++fileNumber)
+    if (label !== undefined) {
+      const tokenChars = Array.from(label)
       let cursorDisplay = -1
       if (sourceIndex === i) cursorDisplay = displayIndex
       else if (sourceIndex === i + 1) cursorDisplay = displayIndex + tokenChars.length - 1
