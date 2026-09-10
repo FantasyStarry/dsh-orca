@@ -492,6 +492,78 @@ if (process.argv.includes('--fullscreen')) {
   }
 }
 
+// ── feature verification (--features): one tiny real prompt that exercises ──
+// the 0.1.5 attachment path (file block + /img) and the model-switch notice
+// together. Costs one minimal API call — only run deliberately.
+if (process.argv.includes('--features')) {
+  const globalTimer = setTimeout(() => fail(`全局超时 ${GLOBAL_TIMEOUT_MS}ms`), GLOBAL_TIMEOUT_MS)
+  try {
+    await waitMarker('TUI 启动', /DeepSeek Harness 终端前端/)
+    await waitMarker('session 已连接', /session 已连接：session-[0-9a-f-]+/)
+    await settle()
+
+    // 1) A non-image file goes through the NEW file path (saveFile → FileBlock)
+    //    and shows its own inline token.
+    const sample = 'C:/Users/Mayn/Desktop/dsh-orca/probe-attach-sample.txt'
+    writeFileSync(sample, 'orca probe attachment\n')
+    proc.write(`/img ${sample}`)
+    await settle()
+    proc.write('\r')
+    await waitMarker('文件附件徽标出现', /\[file #1\]/, 15_000)
+    await settle()
+
+    // 2) Switch to a DIFFERENT model: a real change must be announced to the
+    //    model (the installModelSelection semantics Orca now implements).
+    proc.write('/model')
+    await waitMarker('菜单补全提示', /切换模型/)
+    proc.write('\r')
+    await waitMarker('选择 Provider', /选择 Provider/)
+    await settle(300)
+    proc.write('\r')
+    await waitMarker('选择模型', /选择模型（/)
+    await settle(500)
+    proc.write('\x1b[B') // ↓ — pick a different model than the active one
+    await settle(200)
+    proc.write('\r')
+    await waitMarker('选择思考强度', /选择思考强度（/)
+    await waitMarker('思考档位加载完成', /默认（模型默认行为）/)
+    await settle(150)
+    proc.write('\r')
+    await settle(250)
+    await waitMarker('模型已切换', /模型已切换：/)
+    await settle()
+
+    // 3) The pending attachment MUST have survived the slash commands, and the
+    //    turn must actually run with it (a rejected file block would surface as
+    //    a turn failure row).
+    if (!screen.plain().includes('[file #1]')) fail(`[切完模型] 附件 token 丢失\n${screen.plain()}`)
+    assertInputBox('切完模型后（附件应仍在）', '[file #1]')
+    proc.write('一句话说明这个附件')
+    await settle()
+    proc.write('\r')
+    await waitMarker('回合运行中', /(思考中|执行工具)/, 60_000)
+    await waitMarker('回合结束', /(✓ 本轮|已思考 \d)/, 120_000)
+    await settle(600)
+    assertInputBox('带附件回合结束后', '')
+    const shown = screen.plainAll()
+    if (!shown.includes('[file #1]')) fail(`[附件] user 行未投影 [file #1]\n${screen.plain()}`)
+
+    markSettledSafe(globalTimer)
+    try {
+      writeFileSync('C:/Users/Mayn/Desktop/dsh-orca/probe-last-raw.log', raw)
+    } catch {}
+    proc.write('\x03')
+    await sleep(500)
+    try {
+      proc.kill()
+    } catch {}
+    console.log('features probe 通过 ✔（文件附件通路 + 模型切换告知 + 附件跨命令存活）')
+    process.exit(0)
+  } catch (error) {
+    fail(error instanceof Error ? error.message : String(error))
+  }
+}
+
 // ── live-turn verification (--live): one tiny real prompt, streaming + ──────
 // thinking collapse/expand checked against the app-truth screen. Costs one
 // minimal API call — only run deliberately.

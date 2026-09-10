@@ -501,7 +501,7 @@ export function bootstrapApp(
       looksLikeImagePath(rawPath) &&
       existsSync(resolvePath(unquotedPath))
     ) {
-      void attachImageFile(rawPath)
+      void attachLocalPath(rawPath)
       return
     }
     // No optimistic echo: the user row is projected from the kernel's
@@ -652,7 +652,7 @@ export function bootstrapApp(
       channel.pushSystem('用法：/img <路径>（图片走 image 块，其他文件走 file 块；可多次附加，随下一条消息发送）')
       return
     }
-    await attachImageFile(path)
+    await attachLocalPath(path)
   }
 
   const doNerdFont = (args: string): void => {
@@ -1379,8 +1379,11 @@ export function bootstrapApp(
   )
 
   const menuMatches = (editorText: string): PickerItem[] => {
-    if (!editorText.startsWith('/') || editorText.includes(' ')) return []
-    const prefix = editorText.slice(1).toLowerCase()
+    // Attachment tokens share the editor with the command text; the menu is
+    // derived from the TEXT only, so a pending `[file #1]` never hides it.
+    const plain = stripAttachmentTokens(editorText)
+    if (!plain.startsWith('/') || plain.includes(' ')) return []
+    const prefix = plain.slice(1).toLowerCase()
     const local = SLASH_COMMANDS.filter(
       (cmd) => cmd.name.startsWith(prefix) || cmd.aliases.some((alias) => alias.startsWith(prefix)),
     ).map((cmd) => itemOf(`/${cmd.name}`, cmd.name, cmd.description))
@@ -1403,9 +1406,10 @@ export function bootstrapApp(
     const item = menu.items[menu.index]
     if (!item) return false
     // Completing a command replaces the editor TEXT only: pending attachment
-    // tokens stay put (they belong to the next message, not to the command).
+    // tokens stay put, AHEAD of it (they belong to the next message, not to
+    // the command) — `menuMatches` strips them back out.
     const kept = Array.from(editor).filter(isAttachmentSentinel)
-    editor = `/${item.value}${kept.join('')}`
+    editor = `${kept.join('')}/${item.value}`
     cursorPos = codeLen(editor)
     menuIndex = 0
     return true
@@ -1972,6 +1976,10 @@ export function bootstrapApp(
 
   const isAttachmentSentinel = (ch: string): boolean => ch === IMAGE_SENTINEL || ch === FILE_SENTINEL
 
+  /** The editor's TEXT with attachment tokens removed (menu/command parsing). */
+  const stripAttachmentTokens = (text: string): string =>
+    Array.from(text).filter((ch) => !isAttachmentSentinel(ch)).join('')
+
   /** Index of this sentinel within its own kind, among chars[0..pos). */
   const kindIndexBefore = (chars: readonly string[], pos: number, sentinel: string): number => {
     let n = 0
@@ -2358,8 +2366,11 @@ export function bootstrapApp(
     return isAbsolute(expanded) ? expanded : resolve(process.cwd(), expanded)
   }
 
-  /** Read, admit, and durably store one attachment; it rides the NEXT message. */
-  const attachImageFile = async (rawPath: string): Promise<void> => {
+  /**
+   * Read, admit and durably store ONE local path; it rides the next message.
+   * Images become image blocks, every other file a ile block.
+   */
+  const attachLocalPath = async (rawPath: string): Promise<void> => {
     const attachments = getAttachments()
     if (!attachments) {
       channel.pushSystem('attachments 服务未挂载：无法附加文件（内核需挂载 dsh-attachment-local）')
@@ -2467,7 +2478,7 @@ export function bootstrapApp(
       clearTimeout(timer)
       const text = collected.trim()
       if (text === 'image') {
-        void attachImageFile(out).finally(() => {
+        void attachLocalPath(out).finally(() => {
           try {
             unlinkSync(out) // temp bytes only — the durable ref stays valid
           } catch {
@@ -2480,7 +2491,7 @@ export function bootstrapApp(
         const clipboardText = text.slice(5).trim()
         const single = clipboardText.split(/\r?\n/)[0]?.trim() ?? ''
         if (looksLikeImagePath(single)) {
-          void attachImageFile(single)
+          void attachLocalPath(single)
           return
         }
       }
@@ -2497,7 +2508,7 @@ export function bootstrapApp(
     const cleaned = text.replace(/\r\n?/g, ' ')
     const trimmed = cleaned.trim()
     if (looksLikeImagePath(trimmed)) {
-      void attachImageFile(trimmed)
+      void attachLocalPath(trimmed)
       return
     }
     insertText(cleaned)

@@ -1501,6 +1501,23 @@ async function main(): Promise<void> {
         problems.push(`phase8：文件附件徽标未渲染：${screen.split('\n').find((row) => row.includes('│ >')) ?? ''}`)
       }
     }
+    // A pending attachment token must not hide the inline `/` menu: the menu
+    // is derived from the editor TEXT, tokens excluded.
+    stdin8.text('/he')
+    await sleep(150)
+    {
+      const screen = paintScreen(rw, 24).join('\n')
+      if (!screen.includes('/help')) problems.push('phase8：挂起附件时 / 菜单被遮住')
+    }
+    stdin8.key('backspace')
+    stdin8.key('backspace')
+    stdin8.key('backspace')
+    await sleep(150)
+    {
+      const screen = paintScreen(rw, 24).join('\n')
+      if (screen.includes('/help')) problems.push('phase8：退格后 / 菜单未关闭')
+      if (!screen.includes('[file #1]')) problems.push('phase8：退格删除了附件 token')
+    }
     // /img attaches a durable image; bracketed paste of an image path does too.
     const pngPath = join(tmpdir(), `orca-smoke-${process.pid}.png`)
     writeFileSync(pngPath, Buffer.from([0x89, 0x50, 0x4e, 0x47])) // header-only; the fake store skips decode
