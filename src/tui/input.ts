@@ -307,7 +307,9 @@ export function classify(key: KeyPress): 'submit' | 'cancel' | 'exit' | 'backspa
   if (key.name === 'backspace') return 'backspace'
   // Navigation keys carry escape sequences as their `sequence`; inserting
   // them into the editor would smear raw CSI garbage into the prompt line.
-  // Proper cursor movement is a later milestone — for now they no-op.
+  // They are routed to the app's editor handlers instead (cursor motion,
+  // history recall, picker/menu navigation); `insert`/`pageup`/`pagedown`
+  // are accepted here and deliberately ignored downstream.
   if (['up', 'down', 'left', 'right', 'home', 'end', 'delete', 'pageup', 'pagedown', 'insert'].includes(key.name)) {
     return 'navigate'
   }

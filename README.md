@@ -159,6 +159,17 @@ dsh --profile orca
 
 `cordis.patch.yml` 会插入内核的 `workspace` 行（`@deepseek-ai/dsh-workspace`）——`dsh-base` 不含它，只有 web-app bundle 才挂。它随 dsh 安装一起落盘，正常安装无需额外操作；若某次安装里确实缺这个包，删掉该 `- id: workspace` 行即可恢复（会话不再自动归组，其余功能不受影响）。
 
+## 状态与路线图
+
+已完成：骨架与生命周期 → 真实内核闭环（流式增量、工具卡片、审批配对）→ 视觉层（主题 token、markdown、代码高亮、diff）→ 会话层（`/resume` 浏览、标题、`/compact`、双击 Esc 回退、durable 模型选择、工作区归属）→ 壳层（状态槽、附件通路、全屏备用屏、Kitty 键盘协议、封存行滚入 scrollback）。
+
+未完成：
+
+- 全屏模式下的鼠标选择与复制（OSC 52）
+- 跨平台剪贴板图片粘贴（当前仅 Windows）
+- 输入框多行编辑
+- 鼠标滚轮滚动全屏视图
+
 ## 项目结构
 
 ```text

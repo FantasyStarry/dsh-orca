@@ -1891,7 +1891,7 @@ export function bootstrapApp(
     })()
   }
 
-  // ── /resume browser (placeholder: full picker lands next) ──────────────────
+  // ── /resume browser：内核 sessionQuery 列会话，标题/时间/cwd 尽力补全 ───────
 
   const openResumePicker = (): void => {
     const sessionQuery = getSessionQuery()
