@@ -9,7 +9,7 @@
  * `Config` implements the Standard Schema v1 interface (`~standard.validate`)
  * — that is what cordis's `resolveConfig` calls before starting the plugin
  * (verified against @deepseek-ai/cordis 4.0.2, shipped with dsh
- * v0.1.1-rc.2). A plain defaults table fails the boot with
+ * v0.1.5-rc.1). A plain defaults table fails the boot with
  * `Cannot read properties of undefined (reading 'validate')`. We implement
  * the interface by hand instead of importing schemastery: zero extra
  * runtime deps, and validation coerces wrong-typed keys back to defaults —

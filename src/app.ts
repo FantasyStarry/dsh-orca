@@ -6,7 +6,7 @@
  * disposes the agent. Exit paths (Ctrl+C) run the same disposer.
  *
  * Agent driving follows the real `ctx.agents` contract (dsh-agent
- * v0.1.1-rc.2): `create/resume` return an owned `AgentHandle` whose `agent`
+ * v0.1.5-rc.1): `create/resume` return an owned `AgentHandle` whose `agent`
  * carries the prompt surface (`followup`/`steer` take full `UserMessage`
  * values), and the handle's `dispose` is the only teardown path.
  *

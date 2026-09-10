@@ -114,7 +114,7 @@ export type ImageMediaType = 'image/png' | 'image/jpeg' | 'image/webp' | 'image/
 
 /**
  * A durable raster image reference (dsh-attachment `ImageAttachmentRef`,
- * checked against dsh 0.1.2-rc.1). Opaque storage id + verified facts; never
+ * checked against dsh 0.1.5-rc.1). Opaque storage id + verified facts; never
  * a filesystem path or URL.
  */
 export interface ImageAttachmentRef {
@@ -324,9 +324,8 @@ export interface LlmResolvedModelInfo extends LlmModelInfo {
 /**
  * The LLM runtime (`ctx.llm`, dsh-llm `LlmRuntime` — the selector subset):
  * route/model enumeration plus exact-route resolution for reasoning efforts.
- * As of dsh 0.1.2 the resolution method is `resolveModelInfo` (the older
- * preview name was `resolveModel`); the app calls `resolveModelInfo` first
- * and falls back for stale kernels.
+ * The exact-route resolver is `resolveModelInfo` (`resolveModel` only ever
+ * named a method on the abstract adapter base, never the runtime).
  */
 export interface KernelLlmService {
   listProviders(): readonly LlmProviderInfo[] | Promise<readonly LlmProviderInfo[]>
@@ -384,7 +383,7 @@ export type AgentCancelCause =
   | { readonly kind: 'hook'; readonly reason: string }
   | { readonly kind: 'disposed' }
 
-/** Per-agent options (dsh-agent `AgentOptions`, checked against dsh 0.1.2-rc.1). */
+/** Per-agent options (dsh-agent `AgentOptions`, checked against dsh 0.1.5-rc.1). */
 export interface AgentOptions {
   /** Provider route (must have a registered adapter at call time). */
   readonly provider?: string
@@ -444,7 +443,7 @@ export interface AgentHandle {
 
 /** Options for `ctx.agents.create` (dsh-agent `CreateAgentOptions`, used subset). */
 export interface CreateAgentOptions {
-  /** Creation cancellation (dsh-agent 0.1.2-rc.1). */
+  /** Creation cancellation (dsh-agent, checked 0.1.5-rc.1). */
   readonly signal?: AbortSignal
   /** The live agent/session identity — the caller mints it, e.g. `session-<uuid>`. */
   readonly sessionId: string
@@ -467,7 +466,7 @@ export interface CreateAgentOptions {
 
 /** Options for `ctx.agents.resume` (dsh-agent `ResumeAgentOptions`, used subset). */
 export interface ResumeAgentOptions {
-  /** Resume cancellation (dsh-agent 0.1.2-rc.1). */
+  /** Resume cancellation (dsh-agent, checked 0.1.5-rc.1). */
   readonly signal?: AbortSignal
   /** The persisted session id to load and use as the live identity. */
   readonly resumeSessionId: string
@@ -503,7 +502,7 @@ export interface KernelAgentDefaultModel {
 
 /**
  * One preset directory carrying a mountable agent composition
- * (dsh-agent-presets `AgentPreset`, display subset — checked 0.1.2-rc.1).
+ * (dsh-agent-presets `AgentPreset`, display subset — checked 0.1.5-rc.1).
  */
 export interface AgentPreset {
   /** Stable identifier; the preset directory's name. */
@@ -547,7 +546,7 @@ export interface KernelAgentPresetsService {
  * The kernel agent factory (`ctx.agents`, dsh-agent `AgentRegistry` — the
  * creation subset plus live lookup). Creation/resume are async and return
  * owned handles; `get`/`list` read the live registry without owning.
- * Checked against dsh 0.1.2-alpha.5.
+ * Checked against dsh 0.1.5-rc.1.
  */
 export interface KernelAgentsService {
   create(options: CreateAgentOptions): Promise<AgentHandle>
@@ -558,7 +557,7 @@ export interface KernelAgentsService {
 
 /**
  * Live session store (`ctx.sessions`, dsh-session `SessionStore` — the fork
- * subset Orca needs for rewind). Checked against dsh 0.1.2-alpha.5.
+ * subset Orca needs for rewind). Checked against dsh 0.1.5-rc.1.
  */
 export interface KernelSessionsService {
   fork(source: string | Session, boundary?: number, childSessionId?: string): Session
@@ -568,7 +567,7 @@ export interface KernelSessionsService {
  * Unified session history reads (`ctx.sessionQuery`, dsh-session-query
  * `SessionQueryEngine` — the browser subset). All reads are live-preferred
  * and defensive: any rejection degrades to “no history”.
- * Checked against dsh 0.1.2-alpha.5.
+ * Checked against dsh 0.1.5-rc.1.
  */
 export interface KernelSessionRecord {
   readonly header: { readonly id: string; readonly cwd?: string; readonly createdAt: number }
@@ -602,7 +601,7 @@ export interface KernelSessionQueryService {
 /**
  * Log-backed title service (`ctx.sessionTitle`, dsh-session-title).
  * `rename` pins the title (user source); `get` folds the latest event.
- * Checked against dsh 0.1.2-alpha.5.
+ * Checked against dsh 0.1.5-rc.1.
  */
 export interface KernelSessionTitleSnapshot {
   readonly title: string
@@ -620,7 +619,7 @@ export interface KernelSessionTitleService {
  * Orca dispatches `/compact` etc. through `execute` so the kernel-owned
  * handler (and its `command/run`/`command/done` audit pair) runs verbatim;
  * unknown lines resolve to `undefined` and fall back to a normal prompt.
- * Checked against dsh 0.1.2-alpha.5.
+ * Checked against dsh 0.1.5-rc.1.
  */
 export interface KernelCommandDescriptor {
   readonly name: string
@@ -656,7 +655,7 @@ export interface KernelCommandsService {
  * User-questions seam (`ctx.userQuestions`, dsh-user-questions). The model
  * asks via `dsh-tool-ask-user`; Orca registers the single UI provider that
  * renders the question and returns the human's structured answer.
- * Checked against @deepseek-ai/dsh-user-questions 0.0.1-rc.3.
+ * Checked against @deepseek-ai/dsh-user-questions 0.1.5-rc.1.
  */
 export interface KernelAskUserQuestionOption {
   readonly label: string
@@ -703,7 +702,7 @@ export interface KernelUserQuestionService {
  * session policy (`ask` ⇄ `never` for `/yolo`) and answers the
  * `approval/request` waterfall as the interactive answerer; the audit pair
  * (`approval/asked` + `approval/decided`) is projected from the log.
- * Checked against dsh 0.1.2-alpha.5.
+ * Checked against dsh 0.1.5-rc.1.
  */
 export type KernelApprovalPolicy = 'ask' | 'never'
 
@@ -734,7 +733,7 @@ export interface KernelApprovalService {
  * `AttachmentStore` — the admission subset Orca needs). A submitted image is
  * validated/normalized and committed durably BEFORE the owning user message
  * is appended; the returned reference rides the message's `image` block.
- * Checked against dsh 0.1.2-rc.1. Optional seam — soft-probed.
+ * checked against dsh 0.1.5-rc.1. Optional seam — soft-probed.
  */
 export interface KernelAttachmentLimits {
   readonly maxImageBytes: number
@@ -762,7 +761,7 @@ export interface KernelAttachmentStore {
  * `@path` completion candidates for one agent's working directory
  * (`ctx.fileReferences`, dsh-file-reference `FileReferenceService`).
  * Paths are workspace-relative; directories keep completion open (trailing
- * `/`), files finish the mention. Checked against dsh 0.1.2-rc.1. Optional
+ * `/`), files finish the mention. Checked against dsh 0.1.5-rc.1. Optional
  * seam — soft-probed; Orca falls back to a shallow local scan when absent.
  */
 export interface FileReferenceCandidate {
@@ -800,7 +799,7 @@ export interface KernelContext {
   effect(register: () => (() => void | Promise<void>) | void): void
 }
 
-/** Launcher-owned bounded exit request (`dsh-cmdline` 0.1.2-rc.1). */
+/** Launcher-owned bounded exit request (`dsh-cmdline`, checked 0.1.5-rc.1). */
 export type KernelAppExit = (code: number) => void
 
 /**
