@@ -50,6 +50,8 @@ pnpm test  # 生命周期 + 渲染回归
 | `src/tui/renderer.ts` | 流式追加渲染 + CUP 绝对寻址 + CSI 2026；封存行自然滚入 scrollback，帧输出唯一出口 |
 | `src/tui/chat.ts` | 纯函数帧构建（channel + editor + width → lines） |
 | `src/tui/input.ts` | raw 模式键盘解析（bracketed paste / CSI / Alt 和弦；未知序列丢弃） |
+| `src/clipboard.ts` | 系统剪贴板读取（Windows PowerShell / macOS pngpaste·pbpaste / Linux wl-paste·xclip）；缺工具只提示不抛错，URL 形式的 `file://` 还原成路径 |
+| `src/tui/selection.ts` | 备用屏鼠标选区：纯函数（**cell 列**映射 + SGR 感知的走字），`paintSelection` 只插入反显、不改宽度，`selectionText` 抠出纯文本交给 OSC 52 |
 | `src/tui/keys.ts` | vendored 键盘解码（kimi-code/pi-tui：Kitty 协议 + legacy CSI/SS3）；除两处 `exactOptionalPropertyTypes` 适配外与上游逐字一致，改动要保住可 diff |
 | `src/tui/width.ts` | 显示宽度（`get-east-asian-width`；`…`/`⋯` 额外按 2 cell 计，要精确占满宽度的行必须先过 `asciiEllipses`） |
 | `src/kernel/types.ts` | 内核接缝类型镜像（唯一允许"像内核"的地方） |

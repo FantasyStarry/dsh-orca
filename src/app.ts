@@ -70,9 +70,11 @@ import type {
 import { KERNEL_EVENTS } from './kernel/types.js'
 import { buildFrame, routeKey, routeLine, welcomeCard, IMAGE_SENTINEL, FILE_SENTINEL } from './tui/chat.js'
 import { classify, Keyboard } from './tui/input.js'
-import type { KeyPress } from './tui/input.js'
+import type { KeyPress, MouseReport } from './tui/input.js'
 import { openPicker, movePicker, pickedItem, togglePicker, type PickerItem, type PickerState } from './tui/picker.js'
 import { Renderer } from './tui/renderer.js'
+import { paintSelection, selectionText, type Selection } from './tui/selection.js'
+import { theme } from './tui/theme.js'
 import { currentOrcaVersion, fetchLatestOrcaVersion, installLatestOrca, compareVersions } from './update.js'
 
 export interface AppIoDeps {
@@ -86,6 +88,16 @@ const FACTORY_RETRY_DELAY_MS = 100
 
 /** Paste cap: beyond this the editor would stall the frame builder, so truncate. */
 const PASTE_MAX_CHARS = 20_000
+
+/**
+ * SGR mouse mode: 1002 reports press/release AND drag motion, 1006 switches
+ * the coordinates to `CSI < b ; x ; y M` (1-based cells, no 223-column cap).
+ * Only turned on for the alternate screen — see the startup comment.
+ */
+const MOUSE_ON = '\x1b[?1002h\x1b[?1006h'
+const MOUSE_OFF = '\x1b[?1002l\x1b[?1006l'
+/** Wheel notch → transcript lines (one notch is three lines everywhere else). */
+const WHEEL_LINES = 3
 
 function sleep(ms: number): Promise<void> {
   return new Promise<void>((resolve) => setTimeout(resolve, ms))
@@ -2084,6 +2096,24 @@ export function bootstrapApp(
    * cursor left. Any horizontal move or edit clears it.
    */
   let preferredColumn: number | null = null
+  /**
+   * Alt-screen mouse selection (1-based screen cells) and its drag state.
+   * Only ever set in fullscreen mode: inline mode leaves the mouse to the
+   * terminal so its native selection keeps working.
+   */
+  let mouseSelection: Selection | null = null
+  let mouseDragging = false
+  /**
+   * Fullscreen transcript scroll: the absolute line index the window starts
+   * at, or null while it follows the live tail. Absolute (not "lines above
+   * the bottom") so streaming output does not drag the reader's view.
+   */
+  let scrollTop: number | null = null
+  /** Latest window geometry reported by the frame builder (wheel clamping). */
+  let lastWindowTop = 0
+  let lastWindowMaxTop = 0
+  /** Last painted frame lines, SGR intact — the source for copy extraction. */
+  let lastFrameLines: readonly string[] = []
   let lastEscAt = 0
   /** Double-Ctrl+C exit window (mainstream shell behavior): the first press
    *  interrupts the running turn or clears the editor, the second exits. */
@@ -2738,6 +2768,60 @@ export function bootstrapApp(
     insertText(cleaned)
   }
 
+  /** OSC 52 copy + a notice either way (a terminal may ignore the sequence). */
+  const copyToClipboard = (text: string): void => {
+    const chars = Array.from(text).length
+    if (renderer.copyToClipboard(text)) {
+      channel.pushSystem(`已复制 ${chars} 字符到剪贴板（终端若禁用 OSC 52，可 Shift+拖拽 走原生选择）`)
+      return
+    }
+    channel.pushSystem(`选择过长（${chars} 字符）未复制；缩小范围，或 Shift+拖拽 走原生选择`)
+  }
+
+  /**
+   * Alt-screen mouse: drag selects (reverse video overlay), release copies
+   * through OSC 52, wheel scrolls the transcript window. Inline mode never
+   * receives these events — there the terminal keeps its own selection.
+   */
+  const handleMouse = (event: MouseReport): void => {
+    if (config.fullscreen !== true) return
+    switch (event.kind) {
+      case 'wheel': {
+        const step = event.button === 0 ? -WHEEL_LINES : WHEEL_LINES
+        const next = Math.max(0, Math.min(lastWindowTop + step, lastWindowMaxTop))
+        scrollTop = next >= lastWindowMaxTop ? null : next
+        mouseSelection = null
+        mouseDragging = false
+        render()
+        return
+      }
+      case 'press': {
+        if (event.button !== 0) return
+        mouseSelection = { anchor: { row: event.y, col: event.x }, focus: { row: event.y, col: event.x } }
+        mouseDragging = true
+        render()
+        return
+      }
+      case 'move': {
+        if (!mouseDragging || mouseSelection === null) return
+        mouseSelection = { anchor: mouseSelection.anchor, focus: { row: event.y, col: event.x } }
+        render()
+        return
+      }
+      default: {
+        if (!mouseDragging || mouseSelection === null) return
+        mouseDragging = false
+        const text = selectionText(lastFrameLines, mouseSelection)
+        // Drop the highlight BEFORE repainting: the notice row about to be
+        // pushed shifts nothing (fullscreen windows scroll), but a stale
+        // highlight over moved content would misrepresent what was copied.
+        mouseSelection = null
+        if (text !== '') copyToClipboard(text)
+        render()
+      }
+    }
+  }
+
   const keyboard = new Keyboard(
     stdin,
     (key) => {
@@ -2935,6 +3019,7 @@ export function bootstrapApp(
       }
     },
     handlePaste,
+    handleMouse,
   )
 
   let flushedSealed = 0
@@ -3014,8 +3099,13 @@ export function bootstrapApp(
       askMode,
       branch: gitBranch(cwd),
       nerdFont,
+      scrollTop: fullscreen ? scrollTop : null,
     })
-    renderer.render(frame.live, frame.stream, frame.cursor)
+    // Selection is an alt-screen affordance: the highlight is spliced into
+    // the frame, the raw lines are kept for the copy (SGR-free extraction).
+    lastFrameLines = frame.live
+    const painted = paintSelection(frame.live, mouseSelection, theme.selection)
+    renderer.render(painted, frame.stream, frame.cursor)
     // Advance only past lines the frame actually sedimented. Unflushed sealed
     // lines stay in the live window (visible) and age out a few lines per
     // tick — the 1:1 squeeze instead of a whole-row jump.
@@ -3023,6 +3113,8 @@ export function bootstrapApp(
     flushedLine = flushedSealed !== frame.nextSealedFrom ? 0 : Math.max(0, frame.nextSealedFromLine)
     if (flushedSealed >= channel.rows.length) flushedLine = 0
     lastTranscriptKeep = config.fullscreen === true ? 0 : Math.max(0, frame.transcriptLen)
+    lastWindowTop = frame.windowTop
+    lastWindowMaxTop = frame.windowMaxTop
   }
 
   // ~30fps render tick; the diff painter collapses no-op frames to zero
@@ -3039,7 +3131,17 @@ export function bootstrapApp(
   // mode take the alternate buffer instead — the pre-orca screen is
   // restored verbatim on exit. Bracketed paste (2004) is enabled so pastes
   // arrive as one 200~/201~ burst instead of a keystroke replay.
-  stdout.write((config.fullscreen ? '\x1b[?1049h' : '') + '\x1b[2J\x1b[H\x1b[?2004h')
+  //
+  // Mouse tracking (1002 = button events + drag, 1006 = SGR coordinates) is
+  // enabled ONLY in the alternate screen: there Orca owns every cell and the
+  // terminal's own selection cannot reach the transcript anyway, so drag
+  // selection + OSC 52 copy is the only way to get text out. Inline mode
+  // leaves the mouse to the terminal so native selection/copy keeps working.
+  stdout.write(
+    (config.fullscreen ? '\x1b[?1049h' : '') +
+      '\x1b[2J\x1b[H\x1b[?2004h' +
+      (config.fullscreen ? MOUSE_ON : ''),
+  )
   keyboard.start()
   void runSessionTask(start)
 
@@ -3055,7 +3157,7 @@ export function bootstrapApp(
     // it is cleared. Fullscreen restores the main screen (alt content is
     // discarded by the terminal itself).
     renderer.disposeKeeping(lastTranscriptKeep)
-    if (config.fullscreen) stdout.write('\x1b[?1049l')
+    if (config.fullscreen) stdout.write(MOUSE_OFF + '\x1b[?1049l')
     stdout.write('\x1b[?2004l')
     // Unblock any pending approval asks — late answers are discarded by the
     // service once the signal fires, but our promise must still settle.

@@ -27,7 +27,8 @@ orca / dsh-orca   # 均等价于 dsh --profile orca
 - Plan 模式：`/plan` 只规划不执行
 - 自更新：`orca update` / `/update`
 - 页脚 Nerd Font 分支图标：`/nerdfont`
-- 全屏备用屏模式、滚动缓冲、会话恢复、回退、压缩等
+- 全屏备用屏模式（`--fullscreen`）：转录区成滑动窗口，**鼠标拖拽选择 + 释放即复制**（OSC 52），滚轮上下滚动；inline 模式不接管鼠标，终端原生选择照旧可用（全屏下要原生选择请按住 Shift 拖拽）
+- 流式渲染、会话恢复、回退、压缩等
 
 ## 环境要求
 
@@ -120,6 +121,8 @@ dsh-orca
 | `Esc` | 打断 / 取消 |
 | `Ctrl+C` | 打断 / 双击退出 |
 | `Ctrl+A/E/K/U/W` | readline 编辑（行内语义：Home/End、删到本行首/尾、删词） |
+| 鼠标拖拽（全屏） | 选择文本，松开即复制到剪贴板（OSC 52） |
+| 滚轮（全屏） | 上下滚动转录窗口 |
 
 ## 环境变量
 
@@ -171,12 +174,12 @@ dsh --profile orca
 
 ## 状态与路线图
 
-已完成：骨架与生命周期 → 真实内核闭环（流式增量、工具卡片、审批配对）→ 视觉层（主题 token、markdown、代码高亮、diff）→ 会话层（`/resume` 浏览、标题、`/compact`、双击 Esc 回退、durable 模型选择、工作区归属）→ 壳层（状态槽、附件通路、全屏备用屏、Kitty 键盘协议、封存行滚入 scrollback）。
+已完成：骨架与生命周期 → 真实内核闭环（流式增量、工具卡片、审批配对）→ 视觉层（主题 token、markdown、代码高亮、diff）→ 会话层（`/resume` 浏览、标题、`/compact`、双击 Esc 回退、durable 模型选择、工作区归属）→ 壳层（状态槽、附件通路、多行输入、跨平台剪贴板、全屏备用屏 + 鼠标选择/OSC 52 复制、Kitty 键盘协议、封存行滚入 scrollback）。
 
 未完成：
 
-- 全屏模式下的鼠标选择与复制（OSC 52）
-- 鼠标滚轮滚动全屏视图
+- `--doctor` 自检：一键打印内核版本、各软探测接缝的在位情况、工作区漂移状态（现在只能翻日志）
+- 极窄终端（< 40 列）下的布局取舍
 
 ## 项目结构
 
@@ -186,7 +189,7 @@ src/
   clipboard.ts        # 跨平台剪贴板读取（Windows/macOS/Linux，失败即降级）
   adapter/channel.ts  # session/event → 转录行投影
   kernel/types.ts     # 内核接缝类型镜像
-  tui/                # 渲染、输入、主题、picker、markdown 等
+  tui/                # 渲染、输入、主题、picker、markdown、备用屏选区等
   update.ts           # 自更新逻辑
 bin/
   orca.js             # CLI 启动器

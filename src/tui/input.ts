@@ -41,6 +41,28 @@ export interface KeyPress {
 
 export type KeyHandler = (key: KeyPress) => void
 
+/**
+ * One decoded mouse report (SGR extended mode: `CSI < b ; x ; y M|m`).
+ * Coordinates are 1-based terminal cells, exactly as the terminal reports
+ * them. Orca only enables mouse tracking in the alternate screen, so the
+ * inline mode keeps the terminal's own selection/copy.
+ */
+export interface MouseReport {
+  readonly kind: 'press' | 'release' | 'move' | 'wheel'
+  /** 0 left, 1 middle, 2 right; for `wheel`, 0 = up and 1 = down. */
+  readonly button: number
+  readonly x: number
+  readonly y: number
+  readonly shift: boolean
+  readonly alt: boolean
+  readonly ctrl: boolean
+}
+
+export type MouseHandler = (event: MouseReport) => void
+
+/** SGR mouse: `\x1b[<0;12;5M` (press/move/wheel) / `…m` (release). */
+const SGR_MOUSE_RE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/
+
 const ESC = '\x1b'
 /** How long a lone ESC waits for a CSI prefix before flushing as Esc. */
 const ESC_FLUSH_MS = 40
@@ -93,6 +115,7 @@ function csiTildeKey(params: string): string | null {
 export class Keyboard {
   private readonly handler: KeyHandler
   private readonly onPaste: ((text: string) => void) | null
+  private readonly onMouse: MouseHandler | null
   private active = false
   /** Decoded but not yet parsed input (partial sequences wait here). */
   private pending = ''
@@ -106,9 +129,11 @@ export class Keyboard {
     private readonly stdin: NodeJS.ReadStream,
     handler: KeyHandler,
     onPaste?: (text: string) => void,
+    onMouse?: MouseHandler,
   ) {
     this.handler = handler
     this.onPaste = onPaste ?? null
+    this.onMouse = onMouse ?? null
   }
 
   start(): void {
@@ -253,8 +278,32 @@ export class Keyboard {
     }
   }
 
-  /** CSI → named key; unknown finals (mouse/focus/paste) vanish. */
+  /** CSI → named key; unknown finals (focus/paste markers) vanish. */
   private emitCsi(params: string, final: string, sequence: string): void {
+    // SGR mouse reports never become keys: they carry button, motion and
+    // modifier bits in one code, and the app decides what to do with them.
+    if (this.onMouse && (final === 'M' || final === 'm')) {
+      const mouse = SGR_MOUSE_RE.exec(sequence)
+      if (mouse) {
+        const code = Number(mouse[1])
+        const x = Number(mouse[2])
+        const y = Number(mouse[3])
+        if (Number.isFinite(code) && Number.isFinite(x) && Number.isFinite(y)) {
+          const wheel = (code & 64) !== 0
+          const drag = (code & 32) !== 0
+          this.onMouse({
+            kind: wheel ? 'wheel' : final === 'm' ? 'release' : drag ? 'move' : 'press',
+            button: wheel ? ((code & 1) !== 0 ? 1 : 0) : code & 3,
+            x,
+            y,
+            shift: (code & 4) !== 0,
+            alt: (code & 8) !== 0,
+            ctrl: (code & 16) !== 0,
+          })
+        }
+        return
+      }
+    }
     // Kitty `disambiguate` 模式把裸可打印键发成 CSI-u（`\x1b[97;1u` = `a`）；
     // 先还原成文本，否则 Kitty/Ghostty/WezTerm 下输入直接丢字。release 事件
     //（flag 2 的 `:3` 后缀）永远吞掉——按键松开不应再进一次编辑器。

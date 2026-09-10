@@ -90,6 +90,13 @@ export interface FrameContext {
   readonly nerdFont?: boolean
   /** Alternate-screen mode: whole-viewport window, chrome always pinned. */
   readonly fullscreen?: boolean
+  /**
+   * Fullscreen only: absolute transcript line index the window starts at
+   * (null/omitted = follow the live tail). The alt screen has no native
+   * scrollback, so the wheel / PgUp moves this window instead. Absolute —
+   * not "lines from the bottom" — so streaming does not drag the view.
+   */
+  readonly scrollTop?: number | null
 }
 
 export interface ChatFrame {
@@ -114,6 +121,10 @@ export interface ChatFrame {
    * not lost when the live block is cleared.
    */
   readonly transcriptLen: number
+  /** Fullscreen: absolute line index of the window's first visible row. */
+  readonly windowTop: number
+  /** Fullscreen: the largest legal `windowTop` (0 when nothing overflows). */
+  readonly windowMaxTop: number
 }
 
 export const IMAGE_SENTINEL = ''
@@ -242,8 +253,18 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
     const menuReserve = menuLines.length > 0 ? menuLines.length + 1 : 0
     const windowCap = Math.max(1, height - bottom.length - pickerReserve - menuReserve)
     const totalLines = layout.lineEnds.at(-1) ?? 0
+    // Alt screen has no native scrollback: the wheel moves a window over the
+    // transcript. `scrollTop === null` follows the live tail, and the
+    // windowTop/windowMaxTop pair lets the app clamp and un-pin the scroll.
+    const windowMaxTop = Math.max(0, totalLines - windowCap)
+    const windowTop = Math.max(0, Math.min(ctx.scrollTop ?? windowMaxTop, windowMaxTop))
     let windowLines: string[]
-    if (totalLines > windowCap) {
+    if (windowTop < windowMaxTop) {
+      const above = windowTop
+      const below = windowMaxTop - windowTop
+      const head = above > 0 ? `… 上方还有 ${above} 行 · 下方 ${below} 行` : `… 下方 ${below} 行`
+      windowLines = [theme.muted(head), ...layoutSlice(layout, windowTop, windowCap - 1)]
+    } else if (totalLines > windowCap) {
       const dropped = totalLines - windowCap
       windowLines = [theme.muted(`… 上方还有 ${dropped} 行`), ...layoutTail(layout, Math.max(0, windowCap - 1))]
     } else {
@@ -256,7 +277,16 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
     const bottomStart = live.length
     live.push(...bottom)
     const cursor = cursorPlacement(live.length, bottomStart)
-    return { stream, live, cursor, nextSealedFrom: ctx.sealedFrom, nextSealedFromLine: ctx.sealedFromLine ?? 0, transcriptLen: windowLines.length }
+    return {
+      stream,
+      live,
+      cursor,
+      nextSealedFrom: ctx.sealedFrom,
+      nextSealedFromLine: ctx.sealedFromLine ?? 0,
+      transcriptLen: windowLines.length,
+      windowTop,
+      windowMaxTop,
+    }
   }
 
   // ── inline: sliding window over recent rows + scrollback sedimentation ─────
@@ -466,7 +496,17 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
   // Cursor home: the editor content row is 3 above the frame bottom (box
   // bottom + footer L1 + L2); `│ > ` puts the text at column 5.
   const cursor = cursorPlacement(live.length, bottomStart)
-  return { stream, live, cursor, nextSealedFrom: newBaseRow, nextSealedFromLine: newBaseLine, transcriptLen: transcriptVisible.length }
+  return {
+    stream,
+    live,
+    cursor,
+    nextSealedFrom: newBaseRow,
+    nextSealedFromLine: newBaseLine,
+    transcriptLen: transcriptVisible.length,
+    // Inline mode does not scroll (the terminal owns the scrollback there).
+    windowTop: 0,
+    windowMaxTop: 0,
+  }
 }
 
 function syncChannelLayout(
@@ -565,28 +605,43 @@ function paintTranscriptRow(
   return renderRow(row, ctx, inner).map((line) => (line === '' ? '' : gutter(asciiEllipses(line))))
 }
 
-/** Extract a rendered suffix without traversing or flattening stable history. */
-function layoutTail(layout: ChannelLayoutCache, count: number): string[] {
+/**
+ * Extract `count` rendered lines starting at absolute line `startLine`,
+ * without traversing or flattening stable history (binary search over the
+ * cached per-row line ends). The one primitive behind the tail window and
+ * the alt-screen scroll window.
+ */
+function layoutSlice(layout: ChannelLayoutCache, startLine: number, count: number): string[] {
   const total = layout.lineEnds.at(-1) ?? 0
-  const take = Math.max(0, Math.min(Math.floor(count), total))
+  const start = Math.max(0, Math.min(Math.floor(startLine), total))
+  const take = Math.max(0, Math.min(Math.floor(count), total - start))
   if (take === 0) return []
-  const startLine = total - take
   let lo = 0
   let hi = layout.lineEnds.length
   while (lo < hi) {
     const mid = lo + Math.floor((hi - lo) / 2)
-    if ((layout.lineEnds[mid] ?? 0) > startLine) hi = mid
+    if ((layout.lineEnds[mid] ?? 0) > start) hi = mid
     else lo = mid + 1
   }
   const out: string[] = []
   const before = lo > 0 ? (layout.lineEnds[lo - 1] ?? 0) : 0
   const first = layout.entries[lo]
-  if (first) out.push(...first.lines.slice(startLine - before))
-  for (let i = lo + 1; i < layout.entries.length; i++) {
+  if (first) out.push(...first.lines.slice(start - before))
+  for (let i = lo + 1; i < layout.entries.length && out.length < take; i++) {
     const entry = layout.entries[i]
     if (entry) out.push(...entry.lines)
   }
+  // The last row may overshoot `take`; the first row starts exactly at `start`.
+  out.length = Math.min(out.length, take)
   return out
+}
+
+/** Extract a rendered suffix without traversing or flattening stable history. */
+function layoutTail(layout: ChannelLayoutCache, count: number, skipTail = 0): string[] {
+  const total = layout.lineEnds.at(-1) ?? 0
+  const end = Math.max(0, total - Math.max(0, Math.floor(skipTail)))
+  const take = Math.max(0, Math.min(Math.floor(count), end))
+  return layoutSlice(layout, end - take, take)
 }
 
 /** One-time welcome block — kimi-style box with info rows; brand wordmark. */

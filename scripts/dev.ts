@@ -1629,6 +1629,43 @@ async function main(): Promise<void> {
     if (!snap7.some((row) => row.includes('> 说点什么...'))) problems.push('phase7：fullscreen 编辑框缺失')
     if (!snap7.some((row) => row.includes('上方还有'))) problems.push('phase7：窗口溢出后缺头注')
     if (!snap7.some((row) => row.includes('✓ 本轮'))) problems.push('phase7：转录窗口缺回合结算行')
+
+    // Mouse wheel scrolls the alt-screen window (there is no native
+    // scrollback in the alternate screen).
+    stdin7.text('\x1b[<64;20;10M') // wheel up
+    await sleep(160)
+    const scrolled7 = paintScreen(rw, 24)
+    if (!scrolled7.some((row) => row.includes('下方'))) {
+      problems.push(`phase7：滚轮上滚未移动全屏窗口：${JSON.stringify(scrolled7.slice(0, 3))}`)
+    }
+    stdin7.text('\x1b[<65;20;10M') // wheel down → back to the live tail
+    await sleep(160)
+    if (!paintScreen(rw, 24).some((row) => row.includes('上方还有'))) {
+      problems.push('phase7：滚轮下滚未回到实时尾部')
+    }
+
+    // Drag selection + OSC 52 copy (alt screen only): press on a text row,
+    // drag right, release — the app must emit the clipboard sequence.
+    {
+      const rows7 = paintScreen(rw, 24)
+      const target = rows7.findIndex((row) => /[\u4e00-\u9fa5A-Za-z]/.test(row))
+      if (target === -1) {
+        problems.push('phase7：找不到可选择的文本行')
+      } else {
+        const row = target + 1
+        stdin7.text(`\x1b[<0;3;${row}M`)
+        await sleep(60)
+        stdin7.text(`\x1b[<32;12;${row}M`)
+        await sleep(60)
+        const during = rw.join('')
+        stdin7.text(`\x1b[<0;12;${row}m`)
+        await sleep(200)
+        if (!during.includes('\x1b[?1002h\x1b[?1006h')) problems.push('phase7：fullscreen 启动未开启 SGR 鼠标模式')
+        if (!during.includes('\x1b[7m')) problems.push('phase7：拖拽未把选区画成反显')
+        if (!rw.join('').includes('\x1b]52;c;')) problems.push('phase7：释放后未写出 OSC 52 剪贴板序列')
+        if (!paintScreen(rw, 24).some((line) => line.includes('已复制'))) problems.push('phase7：复制后缺少提示行')
+      }
+    }
     dispose7()
     await sleep(20)
   }

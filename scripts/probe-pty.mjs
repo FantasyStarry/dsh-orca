@@ -483,6 +483,38 @@ if (process.argv.includes('--fullscreen')) {
     await settle()
     assertFooterPinned('fullscreen 切模型后')
     assertInputBox('fullscreen 切模型后', '')
+
+    // ── mouse selection + OSC 52 copy: the alt screen owns the mouse, so a
+    //    drag must highlight and the release must copy the exact text ──
+    {
+      const rows = []
+      for (let r = 0; r < ROWS; r++) rows.push(screen.text(r))
+      const target = rows.findIndex((row) => row.includes('DeepSeek Harness 终端前端'))
+      if (target === -1) fail(`[fullscreen 鼠标] 找不到欢迎卡片标题行\n${screen.plain()}`)
+      const col = rows[target].indexOf('DeepSeek') + 1 // 1-based cell column
+      if (col <= 0) fail(`[fullscreen 鼠标] 标题行里没有 DeepSeek\n${screen.plain()}`)
+      const row = target + 1
+      proc.write(`\x1b[<0;${col};${row}M`) // press on the 'D'
+      await settle(160)
+      proc.write(`\x1b[<32;${col + 7};${row}M`) // drag to the 'k'
+      await settle(160)
+      const appDuringDrag = readFileSync(APP_LOG, 'utf8')
+      if (!appDuringDrag.includes('\x1b[?1002h\x1b[?1006h')) {
+        fail('[fullscreen 鼠标] 启动时未开启 SGR 鼠标模式')
+      }
+      if (!appDuringDrag.includes('\x1b[7mD\x1b[27m')) {
+        fail('[fullscreen 鼠标] 拖拽没有把选区画成反显')
+      }
+      proc.write(`\x1b[<0;${col + 7};${row}m`) // release
+      await settle(300)
+      const app = readFileSync(APP_LOG, 'utf8')
+      const expected = Buffer.from('DeepSeek', 'utf8').toString('base64')
+      if (!app.includes(`\x1b]52;c;${expected}\x07`)) {
+        fail(`[fullscreen 鼠标] 未写出 OSC 52 剪贴板序列（期望 base64=${expected}）`)
+      }
+      if (!app.includes('已复制 8 字符到剪贴板')) fail('[fullscreen 鼠标] 缺少复制成功提示')
+    }
+
     markSettledSafe(globalTimer)
     try {
       writeFileSync(probePath('probe-last-raw.log'), raw)

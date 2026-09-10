@@ -23,6 +23,8 @@ import { truncateWidth } from './width.js'
 const SYNC_START = '\x1b[?2026h'
 const SYNC_END = '\x1b[?2026l'
 const CLEAR_LINE = '\x1b[2K'
+/** OSC 52 payload cap: terminals commonly refuse sequences past ~75 KB. */
+const OSC52_MAX_BASE64 = 80_000
 
 export interface CursorPlacement {
   /** Rows above the bottom of the live block (0 = last row). */
@@ -131,6 +133,24 @@ export class Renderer {
     out.push(SYNC_END)
     this.stdout.write(out.join(''))
     this.last = [...frame]
+  }
+
+  /**
+   * Write text to the system clipboard with OSC 52 (`ESC ] 52 ; c ; base64 BEL`).
+   *
+   * Not a frame — it paints nothing and moves no cursor — but it goes through
+   * the renderer so the byte stream stays one owner's business. Terminals with
+   * OSC 52 disabled simply ignore it, and an oversized payload is refused
+   * (many terminals cap the sequence): the caller reports either outcome.
+   *
+   * @returns false when nothing was written (empty text or too large).
+   */
+  copyToClipboard(text: string): boolean {
+    if (text === '') return false
+    const payload = Buffer.from(text, 'utf8').toString('base64')
+    if (payload.length > OSC52_MAX_BASE64) return false
+    this.stdout.write(`\x1b]52;c;${payload}\x07`)
+    return true
   }
 
   /** Erase the live block on teardown; static history stays in scrollback. */

@@ -83,6 +83,8 @@ export interface PaletteSpec {
   roleUser: Paint
   /** Editor cursor: the char under the logical cursor (reverse video). */
   cursor: Paint
+  /** Mouse selection in the alt screen: reverse video, same as the cursor. */
+  selection: Paint
   /** Tool-card background fill + frame. */
   panel: Paint
   panelBorder: Paint
@@ -113,6 +115,7 @@ const truecolorPalette: PaletteSpec = {
   placeholder: rgb(156, 156, 156), // #9C9C9C
   roleUser: pair('\x1b[1m\x1b[38;2;255;203;107m', '\x1b[39m\x1b[22m'), // #FFCB6B bold
   cursor: pair('\x1b[7m', '\x1b[27m'), // reverse video
+  selection: pair('\x1b[7m', '\x1b[27m'), // reverse video (mouse selection)
   panel: bg(38, 42, 48), // #262A30
   panelBorder: rgb(111, 111, 111), // #6F6F6F
   codeBg: bg(23, 26, 30), // #171A1E
@@ -137,6 +140,7 @@ const palette256: PaletteSpec = {
   placeholder: c256(245), // neutral grey — see the truecolor note (no dim/italic)
   roleUser: pair('\x1b[1;38;5;221m', '\x1b[39m\x1b[22m'),
   cursor: pair('\x1b[7m', '\x1b[27m'), // reverse video
+  selection: pair('\x1b[7m', '\x1b[27m'), // reverse video (mouse selection)
   panel: bg256(236),
   panelBorder: c256(241),
   codeBg: bg256(234),
@@ -161,6 +165,7 @@ const plainPalette: PaletteSpec = {
   placeholder: (t) => t,
   roleUser: (t) => t,
   cursor: (t) => t,
+  selection: (t) => t,
   panel: (t) => t,
   panelBorder: (t) => t,
   codeBg: (t) => t,
