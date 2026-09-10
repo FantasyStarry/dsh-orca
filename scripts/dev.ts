@@ -21,6 +21,7 @@ import { rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { bootstrapApp } from '../src/app.js'
+import { probePath } from './paths.mjs'
 import { Channel } from '../src/adapter/channel.js'
 import { Config } from '../src/index.js'
 import type { OrcaConfig } from '../src/index.js'
@@ -1768,7 +1769,7 @@ async function main(): Promise<void> {
     if (problems.length > 0 || process.env['ORCA_DUMP'] === '1') {
       try {
         writeFileSync(
-          'C:/Users/Mayn/AppData/Local/Temp/opencode/dev-phase8-screen.txt',
+          probePath('dev-phase8-screen.txt'),
           paintScreen(rw, 24, true).map((r, i) => `${String(i).padStart(3)}| ${r}`).join('\n'),
         )
       } catch {}
@@ -2102,8 +2103,9 @@ async function main(): Promise<void> {
   if (problems.length > 0) {
     console.error(`smoke 失败：${problems.join('；')}`)
     try {
-      writeFileSync('C:/Users/Mayn/AppData/Local/Temp/opencode/dev-phase2-screen.txt', rows2.map((r, i) => `${String(i).padStart(3)}| ${r}`).join('\n'))
-      writeFileSync('C:/Users/Mayn/AppData/Local/Temp/opencode/dev-phase3-stream.txt', stripSgr(writes3.join('')))
+      writeFileSync(probePath('dev-phase2-screen.txt'), rows2.map((r, i) => `${String(i).padStart(3)}| ${r}`).join('\n'))
+      writeFileSync(probePath('dev-phase3-stream.txt'), stripSgr(writes3.join('')))
+      console.error(`失败屏面已写入 ${probePath('dev-phase2-screen.txt')} / dev-phase3-stream.txt`)
     } catch {}
     process.exit(1)
   }

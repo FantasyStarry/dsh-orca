@@ -15,13 +15,12 @@
  * Zero API cost (fake kernel). Usage: node scripts/probe-scrollback.mjs
  */
 
-import { createRequire } from 'node:module'
 import { writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
+import { probePath, requireFromDsh } from './paths.mjs'
 
-const require = createRequire('C:/Users/Mayn/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/package.json')
-const pty = require('node-pty')
+const pty = requireFromDsh('node-pty')
 
 const COLS = 100
 const ROWS = 30
@@ -160,10 +159,12 @@ if (!viewport.some((row) => row.includes('> 说点什么...'))) problems.push('�
 
 if (problems.length > 0) {
   console.error(`scrollback probe 失败：${problems.join('；')}`)
-  writeFileSync(join(HERE, '..', 'probe-scrollback-last.txt'), [
+  const file = probePath('probe-scrollback-last.txt')
+  writeFileSync(file, [
     ...term.scrollback.map((g, i) => `${String(i).padStart(4)}| ${(g ?? []).join('').replace(/\s+$/, '')}`),
     ...Array.from({ length: ROWS }, (_, r) => `  V${r}| ${term.line(r)}`),
   ].join('\n'))
+  console.error(`完整屏面已写入 ${file}`)
   process.exit(1)
 }
 console.log(`scrollback probe 通过 ✔（${TURNS} 个回合 × ${LINES} 行全部沉淀可回溯，无 ghost，chrome 钉底）`)

@@ -11,12 +11,13 @@
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { zstdDecompressSync } from 'node:zlib'
+import { DSH_HOME } from './paths.mjs'
 
 /** zstd frame magic (`0xFD2FB528` little-endian). */
 export const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
 
-/** The default DSH home the probes read (`DSH_HOME` wins). */
-export const DEFAULT_DSH_HOME = process.env['DSH_HOME'] ?? 'C:/Users/Mayn/.dsh'
+/** The default DSH home the probes read (`DSH_HOME` wins; never a user name). */
+export const DEFAULT_DSH_HOME = DSH_HOME
 
 /**
  * Decompress a whole `.jsonl.zstd` log. A slice whose first bytes are a

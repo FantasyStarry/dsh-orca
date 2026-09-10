@@ -13,21 +13,19 @@
  *                                    + the session's remembered model; zero API cost)
  */
 
-import { createRequire } from 'node:module'
 import { writeFileSync, readFileSync, readdirSync } from 'node:fs'
 import { DEFAULT_DSH_HOME, findSessionLog, readSessionEvents } from './session-log.mjs'
+import { dshBinPath, dshVersion, probeCwd, probePath, requireFromDsh } from './paths.mjs'
 
-const DSH_PKG = 'C:/Users/Mayn/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/package.json'
-const DSH_BIN = 'C:/Users/Mayn/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/lib/bin.js'
-const CWD = process.env['ORCA_E2E_CWD'] ?? 'C:/Users/Mayn/Desktop/File_Manager_Legacy'
+const DSH_BIN = dshBinPath()
+const CWD = probeCwd()
 const COLS = Number(process.env['ORCA_PROBE_COLS']) || 110
 const ROWS = Number(process.env['ORCA_PROBE_ROWS']) || 45
 const STEP_TIMEOUT_MS = 30_000
 const GLOBAL_TIMEOUT_MS = 150_000
 const DUMP = process.argv.includes('--dump')
 
-const require = createRequire(DSH_PKG)
-const pty = require('node-pty')
+const pty = requireFromDsh('node-pty')
 
 // ── mini terminal emulator ───────────────────────────────────────────────────
 
@@ -248,7 +246,7 @@ if (replayFile) {
 // width policy, which is un-emulatable noise. The app stream is the contract
 // Orca owns — if the app-level grid is correct, any conforming terminal
 // (including ConPTY with matching width tables) renders it correctly.
-const APP_LOG = 'C:/Users/Mayn/Desktop/dsh-orca/probe-orca-app.log'
+const APP_LOG = probePath('probe-orca-app.log')
 try {
   writeFileSync(APP_LOG, '')
 } catch {}
@@ -302,6 +300,11 @@ function pollAppLog() {
   }
 }
 
+// The kernel version and cwd are printed UP FRONT: a probe that silently
+// drives a stale hoisted dsh (or the wrong workspace) is worse than a failure.
+console.log(`probe: dsh ${dshVersion()} @ ${DSH_BIN}`)
+console.log(`probe: cwd ${CWD} · ${COLS}x${ROWS}${DUMP ? ' · --dump' : ''}`)
+
 const proc = pty.spawn(process.execPath, [DSH_BIN, '--profile', 'orca'], {
   name: 'xterm-256color',
   cols: COLS,
@@ -325,8 +328,8 @@ const fail = (message) => {
   console.error(`probe 失败：${message}`)
   try {
     pollAppLog()
-    writeFileSync('C:/Users/Mayn/Desktop/dsh-orca/probe-last-screen.txt', screen.plain())
-    writeFileSync('C:/Users/Mayn/Desktop/dsh-orca/probe-last-raw.log', raw)
+    writeFileSync(probePath('probe-last-screen.txt'), screen.plain())
+    writeFileSync(probePath('probe-last-raw.log'), raw)
     console.error('最终屏幕已写入 probe-last-screen.txt；原始字节已写入 probe-last-raw.log')
   } catch {}
   try {
@@ -482,7 +485,7 @@ if (process.argv.includes('--fullscreen')) {
     assertInputBox('fullscreen 切模型后', '')
     markSettledSafe(globalTimer)
     try {
-      writeFileSync('C:/Users/Mayn/Desktop/dsh-orca/probe-last-raw.log', raw)
+      writeFileSync(probePath('probe-last-raw.log'), raw)
     } catch {}
     proc.write('\x03')
     await sleep(500)
@@ -508,7 +511,7 @@ if (process.argv.includes('--features')) {
 
     // 1) A non-image file goes through the NEW file path (saveFile → FileBlock)
     //    and shows its own inline token.
-    const sample = 'C:/Users/Mayn/Desktop/dsh-orca/probe-attach-sample.txt'
+    const sample = probePath('probe-attach-sample.txt')
     writeFileSync(sample, 'orca probe attachment\n')
     proc.write(`/img ${sample}`)
     await settle()
@@ -554,7 +557,7 @@ if (process.argv.includes('--features')) {
 
     markSettledSafe(globalTimer)
     try {
-      writeFileSync('C:/Users/Mayn/Desktop/dsh-orca/probe-last-raw.log', raw)
+      writeFileSync(probePath('probe-last-raw.log'), raw)
     } catch {}
     proc.write('\x03')
     await sleep(500)
@@ -585,7 +588,7 @@ if (process.argv.includes('--features')) {
 if (process.argv.includes('--state')) {
   const SETTINGS = `${DEFAULT_DSH_HOME}/settings.yaml`
   const WORKSPACES = `${DEFAULT_DSH_HOME}/storages/workspace.json`
-  const APP_LOG2 = 'C:/Users/Mayn/Desktop/dsh-orca/probe-orca-app2.log'
+  const APP_LOG2 = probePath('probe-orca-app2.log')
   const settingsSnapshot = readFileSync(SETTINGS)
   const stripAnsi = (text) => text.replace(/\x1b\[[0-9;?]*[@-~]/g, '').replace(/\x1b[\[\]][^\x07\x1b]*(\x07|\x1b\\)/g, '')
   const routeOf = (selection) =>
@@ -751,7 +754,7 @@ if (process.argv.includes('--state')) {
     await sleep(400)
     markSettledSafe(globalTimer)
     try {
-      writeFileSync('C:/Users/Mayn/Desktop/dsh-orca/probe-last-raw.log', raw)
+      writeFileSync(probePath('probe-last-raw.log'), raw)
     } catch {}
     writeFileSync(SETTINGS, settingsSnapshot)
     console.log('state probe 通过 ✔（工作区归属 + durable 模型记录 + 恢复沿用）')
@@ -907,7 +910,7 @@ try {
 
   markSettled()
   try {
-    writeFileSync('C:/Users/Mayn/Desktop/dsh-orca/probe-last-raw.log', raw)
+    writeFileSync(probePath('probe-last-raw.log'), raw)
   } catch {}
   proc.write('\x03')
   await sleep(500)

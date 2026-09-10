@@ -1,5 +1,7 @@
 # Orca 🐋
 
+[![CI](https://github.com/FantasyStarry/dsh-orca/actions/workflows/ci.yml/badge.svg)](https://github.com/FantasyStarry/dsh-orca/actions/workflows/ci.yml)
+
 **Orca** 是一个运行在 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 内核内的终端前端（TUI），以 Cordis 插件形式挂载。零内核改动，卸载无残留。
 
 ```sh
@@ -131,6 +133,10 @@ dsh-orca
 | `ORCA_LAST_SESSION_FILE` | 覆盖 last-session 标记文件路径 |
 | `ORCA_WORKSPACE_FILE` | 覆盖工作区账本路径（漂移守卫读它；测试用） |
 | `ORCA_SETTINGS_FILE` | 覆盖本地设置文件路径 |
+| `ORCA_DSH_PKG` | 探针用：显式指定 `@deepseek-ai/dsh` 的 `package.json`（默认按 PATH 上的 `dsh` 定位，避免命中陈旧的 hoisted 副本） |
+| `ORCA_PROBE_DIR` | 探针产物目录，默认 `<仓库>/.probe` |
+| `ORCA_E2E_CWD` | 探针的工作目录，默认取工作区账本里第一个已登记路径 |
+| `DSH_HOME` | dsh 家目录，默认 `~/.dsh`（探针读会话日志/设置用） |
 
 ## 开发
 
@@ -149,6 +155,8 @@ node scripts/probe-pty.mjs --state     # 工作区归属 + 会话日志里的模
 node scripts/probe-pty.mjs --features  # 文件附件通路 + 模型切换告知 + 附件跨命令存活
 node scripts/inspect-session.mjs <session-id>   # 会话日志取证（压缩帧感知）
 ```
+
+探针不写死任何本机路径：dsh 安装位置按 PATH 上的 `dsh` 定位（`ORCA_DSH_PKG` 可覆盖），产物落在 `.probe/`，工作目录取已登记工作区。CI（`.github/workflows/ci.yml`）在 ubuntu + windows 上跑 `build` / `test` / `dev`；PTY 探针需要真实内核与 node-pty，只在本地跑。
 
 本地挂载：
 
@@ -182,6 +190,7 @@ src/
 bin/
   orca.js             # CLI 启动器
 scripts/
+  paths.mjs           # 探针共用路径解析（dsh 安装 / 产物目录 / 工作目录）
   dev.ts              # 假内核冒烟 harness
   probe-pty.mjs       # 真 PTY 探针（--state / --features / --live）
   session-log.mjs     # 会话日志读取（zstd 多帧）

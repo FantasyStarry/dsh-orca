@@ -16,22 +16,23 @@
  * Usage: node scripts/e2e-pty.mjs   (exit 0 = pass, 1 = fail)
  */
 
-import { createRequire } from 'node:module'
+import { writeFileSync } from 'node:fs'
+import { dshBinPath, dshVersion, probeCwd, probePath, requireFromDsh } from './paths.mjs'
 
-const DSH_PKG = 'C:/Users/Mayn/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/package.json'
-const DSH_BIN = 'C:/Users/Mayn/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/lib/bin.js'
-const CWD = process.env['ORCA_E2E_CWD'] ?? 'C:/Users/Mayn/Desktop/File_Manager_Legacy'
+const DSH_BIN = dshBinPath()
+const CWD = probeCwd()
 const STEP_TIMEOUT_MS = 30_000
 const GLOBAL_TIMEOUT_MS = 120_000
 
-const require = createRequire(DSH_PKG)
-const pty = require('node-pty')
+const pty = requireFromDsh('node-pty')
 
 const stripAnsi = (text) => text.replaceAll(/\x1b\[[0-9;?]*[A-Za-z]/g, '').replaceAll(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, '')
 
 const markersSeen = []
 let buffer = ''
 let settled = false
+
+console.log(`e2e: dsh ${dshVersion()} · cwd ${CWD}`)
 
 const proc = pty.spawn(process.execPath, [DSH_BIN, '--profile', 'orca'], {
   name: 'xterm-256color',
@@ -47,10 +48,10 @@ proc.onData((data) => {
 
 const fail = (message) => {
   console.error(`e2e 失败：${message}（buffer=${buffer.length} chars）`)
-  const { writeFileSync } = require('node:fs')
   try {
-    writeFileSync('C:/Users/Mayn/Desktop/dsh-orca/e2e-last-buffer.log', buffer)
-    console.error('完整缓冲已写入 e2e-last-buffer.log')
+    const file = probePath('e2e-last-buffer.log')
+    writeFileSync(file, buffer)
+    console.error(`完整缓冲已写入 ${file}`)
   } catch (error) {
     console.error(`缓冲落盘失败：${error.message}`)
   }

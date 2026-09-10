@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Orca is Windows-first (ConPTY) but the kernel and the fake-kernel
+        # smoke are cross-platform; run both so a POSIX-only regression
+        # (path separators, ANSI, width) cannot land unnoticed.
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Build (tsc strict)
+        run: pnpm build
+
+      - name: Test (lifecycle + render regressions)
+        run: pnpm test
+
+      - name: Smoke (fake kernel)
+        run: pnpm dev
