@@ -1,6 +1,6 @@
 {
   "name": "dsh-orca",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Orca — a self-owned in-process TUI front door for DeepSeek Harness, mounted as a Cordis plugin. Zero kernel changes.",
   "keywords": [
     "dsh",

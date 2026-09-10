@@ -12,7 +12,8 @@ orca / dsh-orca   # 均等价于 dsh --profile orca
 - Markdown 渲染 + 轻量代码高亮
 - 工具调用卡片：运行状态、结果、diff 高亮
 - 审批面板：逐次确认 / yolo 自动放行
-- `/model` 三段式切换 provider / model / 思考强度，并持久化默认；切换会向模型注入一条持久告知（等效内核 `installModelSelection` 的可观测行为）
+- `/model` 三段式切换 provider / model / 思考强度；选型会以**内核持久事件** `model/selection` 落进会话日志（与 web 端 `session.selectModel` 同一种记录），并写入 `agent-default-model` 默认值。恢复会话时按内核的读法取值：未生效的 `model/selection` → 会话最后一次 `request/header` → composition 默认，所以「这个会话用哪个模型」在 TUI 与 web 之间一致
+- 会话自动登记进它 cwd 对应的**工作区**（`@deepseek-ai/dsh-workspace` 的 `attachSession`），web 侧栏因此能把 TUI 会话归到对应工作区分组，而不是留在「未分组」；只登记已存在的工作区，不创建/改名/排序
 - `/preset` 切换 Agent 预设
 - 附件输入：`/img`（`/attach`）附加本地文件——图片走 `image` 块、其他文件走 `file` 块；`Ctrl+V` / `Alt+V` 粘贴图片，输入框内联 `[image #N]` / `[file #N]`，支持删除
 - `@` 文件补全
@@ -138,12 +139,23 @@ pnpm test         # 生命周期 + 渲染回归测试
 pnpm dev          # 假内核冒烟测试
 ```
 
+真实内核验证（在 `orca` profile 内，驱动真 PTY；`--features` / `--live` 各花一次最小 API 调用，`--state` 零调用）：
+
+```sh
+node scripts/probe-pty.mjs             # 启动 / 输入框 / 双图层几何
+node scripts/probe-pty.mjs --state     # 工作区归属 + 会话日志里的模型记录与恢复沿用
+node scripts/probe-pty.mjs --features  # 文件附件通路 + 模型切换告知 + 附件跨命令存活
+node scripts/inspect-session.mjs <session-id>   # 会话日志取证（压缩帧感知）
+```
+
 本地挂载：
 
 ```sh
 dsh plugin --profile orca add <本仓库路径>
 dsh --profile orca
 ```
+
+`cordis.patch.yml` 会插入内核的 `workspace` 行（`@deepseek-ai/dsh-workspace`）——`dsh-base` 不含它，只有 web-app bundle 才挂。它随 dsh 安装一起落盘，正常安装无需额外操作；若某次安装里确实缺这个包，删掉该 `- id: workspace` 行即可恢复（会话不再自动归组，其余功能不受影响）。
 
 ## 项目结构
 
@@ -156,6 +168,11 @@ src/
   update.ts           # 自更新逻辑
 bin/
   orca.js             # CLI 启动器
+scripts/
+  dev.ts              # 假内核冒烟 harness
+  probe-pty.mjs       # 真 PTY 探针（--state / --features / --live）
+  session-log.mjs     # 会话日志读取（zstd 多帧）
+  inspect-session.mjs # 会话日志取证 CLI
 cordis.patch.yml      # Cordis 插件挂载配置
 ```
 
