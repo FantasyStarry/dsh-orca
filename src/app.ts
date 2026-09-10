@@ -24,10 +24,9 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { spawn } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync, unlinkSync, appendFileSync, writeFileSync } from 'node:fs'
 import { basename, isAbsolute, join, resolve } from 'node:path'
-import { tmpdir } from 'node:os'
+import { readClipboard } from './clipboard.js'
 import { Channel, isStreamChunk } from './adapter/channel.js'
 import type { SessionRoute } from './adapter/channel.js'
 import type { OrcaConfig } from './index.js'
@@ -2563,19 +2562,24 @@ export function bootstrapApp(
     return dot === -1 ? undefined : IMAGE_MEDIA_TYPES[path.slice(dot)]
   }
 
-  function looksLikeImagePath(text: string): boolean {
-    const trimmed = text.trim()
-    // Windows Explorer 复制文件后粘贴进终端，路径常带引号（尤其含空格时）；
-    // 去掉首尾引号再判断，否则“粘贴图片路径”会完全没反应。
-    const unquoted = trimmed.replace(/^"(.*)"$/, '$1').trim()
-    const lower = unquoted.toLowerCase()
-    const isImage =
+  /** Extension test only — no whitespace guard (file URLs decode to spaced paths). */
+  function hasImageExtension(text: string): boolean {
+    const lower = text.trim().toLowerCase()
+    return (
       lower.endsWith('.png') ||
       lower.endsWith('.jpg') ||
       lower.endsWith('.jpeg') ||
       lower.endsWith('.webp') ||
       lower.endsWith('.gif')
-    if (!isImage) return false
+    )
+  }
+
+  function looksLikeImagePath(text: string): boolean {
+    const trimmed = text.trim()
+    // Windows Explorer 复制文件后粘贴进终端，路径常带引号（尤其含空格时）；
+    // 去掉首尾引号再判断，否则“粘贴图片路径”会完全没反应。
+    const unquoted = trimmed.replace(/^"(.*)"$/, '$1').trim()
+    if (!hasImageExtension(unquoted)) return false
     // 无空格路径直接收；带空格路径必须原本带引号，避免把普通句子误判成图片。
     return !/\s/.test(unquoted) || /^".*"$/.test(trimmed)
   }
@@ -2663,60 +2667,49 @@ export function bootstrapApp(
   }
 
   /**
-   * Ctrl+V / Alt+V: read the clipboard via PowerShell (Windows only) — an
-   * image goes through the attachment path, an image-file path in the text
-   * clipboard attaches directly. Failures degrade to a notice; never break
-   * the TUI. Alt+V is the Windows Terminal escape hatch because it consumes
-   * Ctrl+V for its own paste.
+   * Ctrl+V / Alt+V: read the system clipboard (see `clipboard.ts` — PowerShell
+   * on Windows, pngpaste/pbpaste on macOS, wl-paste/xclip on Linux). An image
+   * goes through the attachment path; an image-file PATH sitting in the text
+   * clipboard attaches directly (that is how every file manager copies a
+   * picture). Failures degrade to a notice; never break the TUI. Alt+V is the
+   * Windows Terminal escape hatch because it consumes Ctrl+V for its own paste.
    */
   const pasteClipboardImage = (): void => {
-    if (process.platform !== 'win32') {
-      channel.pushSystem('剪贴板图片仅支持 Windows（其他平台请用 /img <路径>）')
-      return
-    }
-    const out = join(tmpdir(), `orca-clip-${process.pid}-${Date.now()}.png`)
-    const script = [
-      'Add-Type -AssemblyName System.Windows.Forms',
-      'Add-Type -AssemblyName System.Drawing',
-      '$img = [System.Windows.Forms.Clipboard]::GetImage()',
-      `if ($img) { $img.Save('${out.replaceAll(/\\/g, '\\\\')}', [System.Drawing.Imaging.ImageFormat]::Png); 'image' }`,
-      "else { $t = [System.Windows.Forms.Clipboard]::GetText(); if ($t) { 'text:' + $t } else { 'none' } }",
-    ].join('; ')
-    let collected = ''
-    const child = spawn('powershell.exe', ['-NoProfile', '-STA', '-NonInteractive', '-Command', script], {
-      windowsHide: true,
-      stdio: ['ignore', 'pipe', 'ignore'],
-    })
-    const timer = setTimeout(() => child.kill(), 8000)
-    child.stdout.on('data', (chunk: Buffer) => {
-      collected += chunk.toString('utf8')
-    })
-    child.on('error', () => {
-      clearTimeout(timer)
-      channel.pushSystem('剪贴板读取失败（powershell 不可用）；可用 /img <路径> 附加图片')
-    })
-    child.on('close', () => {
-      clearTimeout(timer)
-      const text = collected.trim()
-      if (text === 'image') {
-        void attachLocalPath(out).finally(() => {
-          try {
-            unlinkSync(out) // temp bytes only — the durable ref stays valid
-          } catch {
-            // Already gone or never written — nothing to clean.
-          }
-        })
-        return
-      }
-      if (text.startsWith('text:')) {
-        const clipboardText = text.slice(5).trim()
-        const single = clipboardText.split(/\r?\n/)[0]?.trim() ?? ''
-        if (looksLikeImagePath(single)) {
-          void attachLocalPath(single)
+    void readClipboard().then((result) => {
+      if (disposed) return
+      switch (result.kind) {
+        case 'image': {
+          const file = result.file
+          void attachLocalPath(file).finally(() => {
+            try {
+              unlinkSync(file) // temp bytes only — the durable ref stays valid
+            } catch {
+              // Already gone or never written — nothing to clean.
+            }
+          })
           return
         }
+        case 'text': {
+          const single = result.text.trim().split(/\r?\n/)[0]?.trim() ?? ''
+          const url = fileUrlToPath(single)
+          const path = url ?? single
+          // A file URL is already a path the user copied deliberately, so it
+          // skips the "spaces need quotes" heuristic that plain text needs.
+          if (hasImageExtension(path) && (url !== null || looksLikeImagePath(path))) {
+            void attachLocalPath(path)
+            return
+          }
+          channel.pushSystem('剪贴板里没有图片（复制文件或截图后再按 Ctrl+V/Alt+V；文本请用终端粘贴）')
+          return
+        }
+        case 'unavailable':
+          channel.pushSystem(result.message)
+          return
+        default:
+          channel.pushSystem('剪贴板里没有图片（复制文件或截图后再按 Ctrl+V/Alt+V；文本请用终端粘贴）')
       }
-      channel.pushSystem('剪贴板里没有图片（复制文件或截图后再按 Ctrl+V/Alt+V；文本请用终端粘贴）')
+    }).catch((error: unknown) => {
+      channel.pushSystem(`剪贴板读取失败：${error instanceof Error ? error.message : String(error)}；可用 /img <路径>`)
     })
   }
 
@@ -3122,6 +3115,27 @@ function recordOf(value: unknown): Record<string, unknown> | undefined {
 
 function shortSessionLabel(id: string): string {
   return id.length > 18 ? '..' + id.slice(-12) : id
+}
+
+/**
+ * `file://` URL → filesystem path. File managers on Linux copy
+ * `text/uri-list` entries and browsers/iOS copy `file://` too, so a pasted
+ * picture often arrives as a URL rather than a bare path. Returns null when
+ * the text is not a file URL.
+ */
+export function fileUrlToPath(text: string): string | null {
+  const match = /^file:\/\/(.*)$/i.exec(text.trim())
+  if (!match) return null
+  let rest = match[1] ?? ''
+  try {
+    rest = decodeURIComponent(rest) // %20 and CJK names
+  } catch {
+    // Malformed escape — keep the raw form rather than losing the path.
+  }
+  // file:///C:/dir/x.png → /C:/dir/x.png → C:/dir/x.png on Windows; POSIX
+  // paths keep their leading slash.
+  if (/^\/[A-Za-z]:\//.test(rest)) rest = rest.slice(1)
+  return rest
 }
 
 function shortPath(cwd: string): string {

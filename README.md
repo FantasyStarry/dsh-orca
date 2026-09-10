@@ -18,7 +18,7 @@ orca / dsh-orca   # 均等价于 dsh --profile orca
 - 会话自动登记进它 cwd 对应的**工作区**（`@deepseek-ai/dsh-workspace` 的 `attachSession`），web 侧栏因此能把 TUI 会话归到对应工作区分组，而不是留在「未分组」；只登记已存在的工作区，不创建/改名/排序。
   注意这是**跨进程共享的单文档账本**：写入是整份覆盖，而 web 进程只在启动时读一次。所以（1）TUI 登记后需要**重启一次 web 服务**才能在侧栏看到归属；（2）若 web 在本 TUI 启动后写过账本，TUI 会**拒绝登记**（漂移守卫，避免用旧快照覆盖你在 web 里做的改动），此时改天重开 TUI 即可重试
 - `/preset` 切换 Agent 预设
-- 附件输入：`/img`（`/attach`）附加本地文件——图片走 `image` 块、其他文件走 `file` 块；`Ctrl+V` / `Alt+V` 粘贴图片，输入框内联 `[image #N]` / `[file #N]`，支持删除
+- 附件输入：`/img`（`/attach`）附加本地文件——图片走 `image` 块、其他文件走 `file` 块；`Ctrl+V` / `Alt+V` 粘贴图片，输入框内联 `[image #N]` / `[file #N]`，支持删除。剪贴板读取按平台走现成工具（Windows PowerShell、macOS `pngpaste`/`pbpaste`、Linux `wl-paste`/`xclip`），缺工具时降级为一句提示，绝不阻塞 TUI
 - `@` 文件补全
 - 多行输入：`Alt+Enter`（`Shift+Enter` / `Ctrl+J` 同义）换行，长行按 cell 软换行，编辑框随内容长高（上限 8 行，超出时底边提示 `↑/↓ N 行`）；`↑`/`↓` 在文本内移动光标，只在首/末行才召回历史；`Home/End`/`Ctrl+A`/`Ctrl+E`/`Ctrl+U`/`Ctrl+K` 都是行内语义
 - 待办列表：`/todo`
@@ -176,7 +176,6 @@ dsh --profile orca
 未完成：
 
 - 全屏模式下的鼠标选择与复制（OSC 52）
-- 跨平台剪贴板图片粘贴（当前仅 Windows）
 - 鼠标滚轮滚动全屏视图
 
 ## 项目结构
@@ -184,6 +183,7 @@ dsh --profile orca
 ```text
 src/
   app.ts              # 装配：TTY、agent、channel、renderer、keyboard
+  clipboard.ts        # 跨平台剪贴板读取（Windows/macOS/Linux，失败即降级）
   adapter/channel.ts  # session/event → 转录行投影
   kernel/types.ts     # 内核接缝类型镜像
   tui/                # 渲染、输入、主题、picker、markdown 等
