@@ -14,7 +14,7 @@ orca / dsh-orca   # 均等价于 dsh --profile orca
 - Markdown 渲染 + 轻量代码高亮
 - 工具调用卡片：运行状态、结果、diff 高亮
 - 审批面板：逐次确认 / yolo 自动放行
-- `/model` 三段式切换 provider / model / 思考强度；选型会以**内核持久事件** `model/selection` 落进会话日志（与 web 端 `session.selectModel` 同一种记录），并写入 `agent-default-model` 默认值。恢复会话时按内核的读法取值：未生效的 `model/selection` → 会话最后一次 `request/header` → composition 默认，所以「这个会话用哪个模型」在 TUI 与 web 之间一致。
+- `/model` 三段式切换 provider / model / 思考强度；选型会以**内核持久事件** `model/selection` 落进会话日志（与 web 端 `session.selectModel` 同一种记录），并**同时写入 `agent-default-model` 全局默认**——所以 TUI 里换一次模型，之后所有新会话（含 web 端新建的）都从它开始；这是有意的：web 端的「会话内选型」只改本会话，TUI 的 `/model` 两者都改，确认行会写明「已同步为新会话默认」。恢复会话时按内核的读法取值：未生效的 `model/selection` → 会话最后一次 `request/header` → composition 默认，所以「这个会话用哪个模型」在 TUI 与 web 之间一致。
   切换同时按内核 `installModelSelection` 的三条缝生效：**系统提示词里的 `{{provider}}`/`{{model}}` 跟着切换**（否则预设 persona 会一直说「powered by 旧模型」）、请求按装配时的快照路由（一次步骤内不会一半旧一半新）、并给模型一条 durable 告知（「上文这些回合是 X 生成的，本会话改用 Y」）
 - 会话自动登记进它 cwd 对应的**工作区**（`@deepseek-ai/dsh-workspace` 的 `attachSession`），web 侧栏因此能把 TUI 会话归到对应工作区分组，而不是留在「未分组」；只登记已存在的工作区，不创建/改名/排序。
   注意这是**跨进程共享的单文档账本**：写入是整份覆盖，而 web 进程只在启动时读一次。所以（1）TUI 登记后需要**重启一次 web 服务**才能在侧栏看到归属；（2）若 web 在本 TUI 启动后写过账本，TUI 会**拒绝登记**（漂移守卫，避免用旧快照覆盖你在 web 里做的改动），此时改天重开 TUI 即可重试
