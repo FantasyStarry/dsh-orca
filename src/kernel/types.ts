@@ -22,10 +22,16 @@
  *   (`list`/`resolve`), the user default (`defaultId`), per-agent live lookup
  *   (`composedPreset`) and standing-mount composition (`mount`, called from the
  *   agent factory `setup` hook — the only supported call site).
- * - `dsh-session` → `Session`, `SessionEvent`, `SessionEventMap`, and the
- *   `session/*` cordis events. The appendable surface is `assistant/message`
- *   (embedding the attempt `stream`), `assistant/attempt`, `system/message`,
- *   and the log-only boundary/audit events — there is no chunk event.
+ * - `dsh-session` → `Session` (`snapshotEvents`, `requestHeader`, `append`,
+ *   `header`), `SessionEvent`, `SessionEventMap`, and the `session/*` cordis
+ *   events. The appendable surface is `assistant/message` (embedding the
+ *   attempt `stream`), `assistant/attempt`, `system/message`, and the log-only
+ *   boundary/audit events — there is no chunk event.
+ * - `dsh-workspace` → `WorkspaceRegistry` (`ctx.workspaceRegistry`,
+ *   `list` / `resolveByPath`) and `Workspace` (`path`, `sessionIds`,
+ *   `attachSession`): the durable Workspace + Session-membership account the
+ *   web sidebar groups by. NOT part of `dsh-base` — the Orca bundle mounts the
+ *   row, and every use is soft-probed.
  * - `dsh-llm` → `StreamChunk`, `ContentBlock` (incl. `ImageBlock` / the
  *   0.1.5 `FileBlock`), message roles, and the `LlmRuntime` selector surface —
  *   exact-route resolution is `resolveModelInfo(provider, model)` (the name
@@ -250,7 +256,15 @@ export interface SessionEventMap {
   'tool/result': { readonly turn: number; readonly step: number; readonly message: ToolResultMessage; readonly error?: { readonly name: string; readonly code: string } }
   'todo/write': { readonly todos: readonly TodoItem[] }
   /** Full request header snapshot; the latest one reconstructs the route (dsh-session `EpochHeader`). */
-  'request/header': { readonly header: { readonly config: LlmCallConfig }; readonly reason: string }
+  'request/header': { readonly header: EpochHeader; readonly reason: string }
+  /**
+   * Durable model-selection intent (0.1.5; appended by the web host's
+   * `session.selectModel` and by Orca's `/model`). It is the SESSION's own
+   * record of "run the next request on this route": a reader applies it while
+   * it differs from the last `request/header` config, then considers it
+   * consumed. It never reaches the model surface (log-only).
+   */
+  'model/selection': { readonly provider: string; readonly model: string; readonly reasoningEffort?: string }
   /** Durable approval override (`dsh-user-approval`); the LAST one wins. */
   'approval/policy': { readonly policy: KernelApprovalPolicy; readonly source?: 'delegation' }
   /** Approval audit pair (`dsh-user-approval`, log-only, paired by `id`). */
@@ -269,6 +283,26 @@ export interface LlmCallConfig {
   readonly temperature?: number
   readonly maxTokens?: number
   readonly stop?: readonly string[]
+}
+
+/**
+ * Fields the resolved adapter materialized itself rather than receiving from
+ * the caller (dsh-llm `LlmCallConfigAdapterDefaults`). A `reasoningEffort`
+ * flagged here is the adapter's own default, so it must NOT be read back as an
+ * explicit route choice — the kernel's model-selection fold drops it.
+ */
+export interface LlmCallConfigAdapterDefaults {
+  readonly reasoningEffort?: boolean
+}
+
+/**
+ * The request header in force after one `request/header` event
+ * (dsh-session `EpochHeader`). `adapterDefaults` is absent unless the adapter
+ * materialized some field itself.
+ */
+export interface EpochHeader {
+  readonly config: LlmCallConfig
+  readonly adapterDefaults?: LlmCallConfigAdapterDefaults
 }
 
 /** Token accounting reported by the adapter (dsh-llm `TokenUsage`). */
@@ -360,18 +394,70 @@ export interface SessionEvent {
 export interface Session {
   readonly id: string
   /**
+   * Immutable storage metadata (dsh-session `SessionHeader`): the creation-time
+   * `cwd` a workspace membership check validates against, and `createdAt`.
+   */
+  readonly header: { readonly id: string; readonly cwd?: string; readonly createdAt: number }
+  /**
    * Materialize an immutable snapshot of the log (dsh 0.1.5 `snapshotEvents`).
    * This is the ONLY snapshot API — the preview-era `session.events` field no
    * longer exists in the kernel and is not mirrored.
    */
   snapshotEvents(fromSeq?: number, toSeqExclusive?: number): readonly SessionEvent[]
   /**
+   * The {@link EpochHeader} in force after the log's last header event — what
+   * the NEXT request is compared against — or `undefined` before the first
+   * one (dsh 0.1.5 `Session.requestHeader`, an incrementally maintained fold).
+   * Optional here only because the mirror must survive a kernel without it.
+   */
+  requestHeader?(): EpochHeader | undefined
+  /**
    * Append one event. The real signature is strongly typed per event type and
    * requires surface metadata for surface types (`system/message`,
-   * `user/message`, `assistant/message`, `tool/result`) — Orca appends no
-   * events at all today, so the mirror stays on the log-only shape.
+   * `user/message`, `assistant/message`, `tool/result`); Orca appends ONLY the
+   * log-only `model/selection` route intent, so the mirror stays on that shape.
    */
   append(type: string, data: Record<string, unknown>): SessionEvent
+}
+
+// ── dsh-workspace: the durable Workspace account the web sidebar groups by ──
+
+/**
+ * One durable Workspace registration (dsh-workspace `Workspace`, display +
+ * membership subset — checked against 0.1.5-rc.1). `path` is the canonical
+ * `fs.realpath` stamp; `sessionIds` is the ordered ownership account.
+ */
+export interface KernelWorkspace {
+  readonly id: string
+  readonly path: string
+  readonly title: string
+  readonly sessionIds: readonly string[]
+  /**
+   * Record one session as owned by this workspace. Rejects (never no-ops) when
+   * the session's stored header carries no `cwd`, its `cwd` does not resolve,
+   * or it resolves to a different directory — so a caller must never swallow
+   * the difference between "attached" and "refused". Idempotent for a session
+   * already accounted here.
+   */
+  attachSession(sessionId: string): Promise<void>
+}
+
+/**
+ * Durable workspace registry (`ctx.workspaceRegistry`, dsh-workspace
+ * `WorkspaceRegistry` — the lookup subset Orca needs). NOT mounted by
+ * `dsh-base`: the Orca bundle inserts the `workspace` row, and a composition
+ * without it degrades to "no workspace accounting" silently.
+ * Checked against dsh 0.1.5-rc.1.
+ */
+export interface KernelWorkspaceRegistry {
+  /** Ordered registry projection; performs no persistence reads. */
+  list(): readonly KernelWorkspace[]
+  /**
+   * Resolve the workspace owning one directory, without creating or mutating
+   * anything: an existing unowned directory resolves to `undefined`, a path
+   * that does not resolve rejects.
+   */
+  resolveByPath(path: string): Promise<KernelWorkspace | undefined>
 }
 
 // ── dsh-agent: registry, handle, agent ──────────────────────────────────────

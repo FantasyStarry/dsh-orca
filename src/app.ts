@@ -14,6 +14,13 @@
  * without importing kernel packages: an `agent/request` waterfall listener
  * on the agent's own scope rewrites the resolved call config with the live
  * selection; `agentDefaultModel.saveSelection` persists it best-effort.
+ *
+ * Which route a session runs on is NOT Orca's invention: it is folded from the
+ * SESSION's own durable record exactly as the web host does it — the last
+ * still-unused `model/selection` event, else the last `request/header`
+ * config, else the composition default (`agentDefaultModel`). A pick appends
+ * the same log-only `model/selection` event the web's `session.selectModel`
+ * appends, so both front doors read back the same answer.
  */
 
 import { randomUUID } from 'node:crypto'
@@ -29,6 +36,7 @@ import type {
   AgentHandle,
   AgentScopedContext,
   ContentBlock,
+  EpochHeader,
   FileAttachmentRef,
   FileReferenceCandidate,
   ImageAttachmentRef,
@@ -52,6 +60,8 @@ import type {
   KernelSessionQueryService,
   KernelSessionTitleService,
   KernelSessionsService,
+  KernelWorkspaceRegistry,
+  Session,
   SessionEvent,
   StreamChunk,
   TodoItem,
@@ -215,6 +225,8 @@ export function bootstrapApp(
   const getAttachments = (): KernelAttachmentStore | undefined => ctx.get<KernelAttachmentStore>('attachments', false)
   const getFileReferences = (): KernelFileReferenceService | undefined =>
     ctx.get<KernelFileReferenceService>('fileReferences', false)
+  const getWorkspaceRegistry = (): KernelWorkspaceRegistry | undefined =>
+    ctx.get<KernelWorkspaceRegistry>('workspaceRegistry', false)
 
   let handle: AgentHandle | null = null
   let agent: Agent | null = null
@@ -1119,6 +1131,16 @@ export function bootstrapApp(
       bufferedEvents = []
       replaying = false
       handle = created
+      // Which route this session runs on is the SESSION's own record, not this
+      // process's last pick: a resumed session carries the model it was last
+      // used on (web or TUI), so it must outrank a leftover live selection.
+      // A fresh session has neither, and keeps the picker/default answer.
+      const recorded = durableSelection(created.agent.session)
+      if (recorded !== undefined) {
+        dbg(`会话记录的模型：${recorded.provider}/${recorded.model}${recorded.reasoningEffort ?? ''}`)
+        selection = recorded
+        effortCleared = recorded.reasoningEffort === undefined
+      }
       attachAgent(created.agent)
     } catch (error) {
       await created.dispose().catch(() => {})
@@ -1132,6 +1154,9 @@ export function bootstrapApp(
     // reload): the next bootstrap resumes THIS session instead of minting a
     // new one, so rebuilds stop stacking welcomes on the screen.
     writeLastSession(created.agent.session.id)
+    // Fire-and-forget: a storage write must never gate the first frame, and
+    // the helper contains every failure.
+    void attachSessionToWorkspace(created.agent.session)
     return true
   }
 
@@ -1192,6 +1217,64 @@ export function bootstrapApp(
           ...(fallbackEffort !== undefined ? { reasoningEffort: fallbackEffort } : {}),
         }
       : undefined
+  }
+
+  /** Two routes are the same selection when provider, model and effort match. */
+  const sameRoute = (left: SessionRoute, right: SessionRoute): boolean =>
+    left.provider === right.provider &&
+    left.model === right.model &&
+    left.reasoningEffort === right.reasoningEffort
+
+  /**
+   * The route ONE session is recorded on, read out of its own log exactly the
+   * way the kernel reads it (`dsh-api-session-controller`'s
+   * `selectionFor` + the `model/selection` projection):
+   *
+   * 1. the last `model/selection` event, while it still differs from the route
+   *    of the last request — a pick the next request has not consumed yet;
+   * 2. else the last `request/header` config — the route actually used last;
+   * 3. else nothing, and the caller falls back to the composition default.
+   *
+   * An effort the ADAPTER materialized itself (`adapterDefaults.reasoningEffort`)
+   * is not a choice anyone made, so it is dropped rather than re-pinned.
+   * History is read live-preferred: a resumed session's snapshot IS its durable
+   * log, so this needs no persistence read of its own.
+   */
+  const durableSelection = (session: Session): SessionRoute | undefined => {
+    let picked: SessionRoute | undefined
+    try {
+      for (const event of session.snapshotEvents()) {
+        if (event.type !== 'model/selection') continue
+        const data = recordOf(event.data)
+        const provider = data === undefined || typeof data['provider'] !== 'string' ? '' : data['provider']
+        const model = data === undefined || typeof data['model'] !== 'string' ? '' : data['model']
+        if (provider === '' || model === '') continue
+        const effort = data !== undefined && typeof data['reasoningEffort'] === 'string' ? data['reasoningEffort'] : ''
+        picked = { provider, model, ...(effort !== '' ? { reasoningEffort: effort } : {}) }
+      }
+    } catch {
+      return undefined
+    }
+    const used = routeOfHeader(session)
+    if (picked !== undefined && (used === undefined || !sameRoute(picked, used))) return picked
+    return used
+  }
+
+  /** The route of the session's last `request/header`, without adapter-materialized fields. */
+  const routeOfHeader = (session: Session): SessionRoute | undefined => {
+    let header: EpochHeader | undefined
+    try {
+      header = session.requestHeader?.()
+    } catch {
+      return undefined
+    }
+    const config = header?.config
+    if (config === undefined) return undefined
+    const provider = typeof config.provider === 'string' ? config.provider : ''
+    const model = typeof config.model === 'string' ? config.model : ''
+    if (provider === '' || model === '') return undefined
+    const effort = header?.adapterDefaults?.reasoningEffort === true ? undefined : config.reasoningEffort
+    return { provider, model, ...(typeof effort === 'string' && effort !== '' ? { reasoningEffort: effort } : {}) }
   }
 
   const attachAgent = (next: Agent): void => {
@@ -1455,6 +1538,23 @@ export function bootstrapApp(
     const effort = next.reasoningEffort ? `(${next.reasoningEffort})` : ''
     channel.pushSystem(`模型已切换：${next.provider}/${next.model}${effort} · 下一次请求生效`)
     announceSelection(next)
+    // Durable, log-only route intent: the SAME event the web host's
+    // `session.selectModel` appends, so the choice lives in the session's own
+    // log and either front door reads it back (`durableSelection`). Without it
+    // a TUI pick is invisible to the web and dies with this process. Never
+    // fatal: a rejected append (a concurrent append is the documented case)
+    // leaves the in-memory switch intact for this run.
+    try {
+      agent?.session.append('model/selection', {
+        provider: next.provider,
+        model: next.model,
+        ...(next.reasoningEffort !== undefined && next.reasoningEffort !== ''
+          ? { reasoningEffort: next.reasoningEffort }
+          : {}),
+      })
+    } catch (error) {
+      dbg(`model/selection 追加失败：${error instanceof Error ? error.message : String(error)}`)
+    }
     const defaultModel = getDefaultModel()
     if (defaultModel) {
       // Persist as the composition default, best-effort — the settings write
@@ -1471,6 +1571,44 @@ export function bootstrapApp(
   const pickFailed = (error: unknown): void => {
     closePicker()
     channel.pushSystem(`枚举模型失败：${error instanceof Error ? error.message : String(error)}`)
+  }
+
+  /**
+   * Record this session under the Workspace that owns its `cwd`, so the web
+   * sidebar groups the TUI conversation with the same directory instead of
+   * leaving it in the ungrouped pile. Workspace membership is durable host
+   * state (`~/.dsh/storages/workspace.json`) shared with the web process; the
+   * TUI only ever ADDs its own live session to a workspace that already
+   * exists — it never creates, renames, reorders or archives anything.
+   *
+   * Soft everywhere (#183): no `workspaceRegistry` (a profile without the
+   * Orca bundle's `workspace` row), no workspace for this cwd (the directory
+   * was never added as one), or a refused attach all degrade to silence — a
+   * session that cannot be filed is still a working session.
+   */
+  const attachSessionToWorkspace = async (session: Session): Promise<void> => {
+    const registry = getWorkspaceRegistry()
+    if (!registry) return
+    const cwd = session.header?.cwd
+    if (typeof cwd !== 'string' || cwd === '') return
+    try {
+      const workspace = await registry.resolveByPath(cwd)
+      if (workspace === undefined) {
+        dbg(`工作区未登记，跳过归属：${cwd}`)
+        return
+      }
+      if (workspace.sessionIds.includes(session.id)) {
+        dbg(`会话本就在工作区 ${workspace.path} 内`)
+        return
+      }
+      await workspace.attachSession(session.id)
+      dbg(`会话已归入工作区 ${workspace.path}`)
+    } catch (error) {
+      // `attachSession` validates the header cwd against the workspace path and
+      // REJECTS instead of no-oping: a refused attach is a real answer about
+      // where this session belongs, so it is reported, never retried blindly.
+      dbg(`工作区归属失败：${error instanceof Error ? error.message : String(error)}`)
+    }
   }
 
   const confirmPicker = (): void => {

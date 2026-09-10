@@ -34,6 +34,19 @@
     - id: subagent-model-selection-settings
       name: '@deepseek-ai/dsh-tool-subagent/model-selection-settings'
 
+    # The durable Workspace registry (`ctx.workspaceRegistry`, package
+    # `@deepseek-ai/dsh-workspace`) is NOT part of dsh-base — it ships with the
+    # web-app bundle. The TUI needs it to file its own session under the
+    # workspace that owns the session's cwd: without that accounting the web
+    # sidebar can only offer TUI conversations in its ungrouped pile, and no
+    # TUI action can ever move them (membership is host-side, `attachSession`
+    # only). The id deliberately matches the dsh-web-app row, so a composition
+    # carrying both bundles collapses to ONE registry rather than mounting two.
+    # Orca only ever ADDs a live session it created to a workspace that already
+    # exists; it creates, renames, reorders and archives nothing.
+    - id: workspace
+      name: '@deepseek-ai/dsh-workspace'
+
 - insert:
     # Entry-level inject only; the plugin module's own code-level inject stays
     # empty so a stale patch cannot deadlock a composition lacking these
