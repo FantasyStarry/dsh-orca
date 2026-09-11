@@ -13,7 +13,8 @@ orca / dsh-orca   # 均等价于 dsh --profile orca
 - 流式渲染：真实增量上屏，历史自动沉淀进终端 scrollback
 - Markdown 渲染 + 轻量代码高亮
 - 工具调用卡片：运行状态、结果、diff 高亮
-- 审批面板：逐次确认 / yolo 自动放行
+- 审批面板：逐次确认 / yolo 自动放行；`Ctrl-E` 展开完整参数，`1`/`2`/`3`/`4` 编号直选
+- 本地审批规则层（`/perms`，别名 `/rules`）：命中 `allow`/`deny` 的调用由规则**直接替内核应答**（`allowed-once` / `rejected`），不再弹窗；只有未命中或命中 `ask` 才打扰你。规则分四级——内置（8 条只读工具免问，`/perms reads off` 可关）、用户（`$DSH_HOME/orca/permissions.json`）、项目（`<cwd>/.orca/permissions.json`，可提交进仓库）、会话（面板里按 `2` 临时放行）。判定恒定优先级 `deny` > `ask` > `allow`，同档时范围更靠后的赢（builtin < user < project < session）；`allow *` 会被明确拒绝（整机放行请用 `/yolo`）。落盘的是可读、可评审的 JSON，面板还会给出「总是放行 bash(npm ci:*)」这类窄规则供复核。**内核仍然拥有 ask、审计与沙箱，Orca 只决定答案**
 - `/model` 三段式切换 provider / model / 思考强度；选型会以**内核持久事件** `model/selection` 落进会话日志（与 web 端 `session.selectModel` 同一种记录），并**同时写入 `agent-default-model` 全局默认**——所以 TUI 里换一次模型，之后所有新会话（含 web 端新建的）都从它开始；这是有意的：web 端的「会话内选型」只改本会话，TUI 的 `/model` 两者都改，确认行会写明「已同步为新会话默认」。恢复会话时按内核的读法取值：未生效的 `model/selection` → 会话最后一次 `request/header` → composition 默认，所以「这个会话用哪个模型」在 TUI 与 web 之间一致。
   切换同时按内核 `installModelSelection` 的三条缝生效：**系统提示词里的 `{{provider}}`/`{{model}}` 跟着切换**（否则预设 persona 会一直说「powered by 旧模型」）、请求按装配时的快照路由（一次步骤内不会一半旧一半新）、并给模型一条 durable 告知（「上文这些回合是 X 生成的，本会话改用 Y」）
 - 会话自动登记进它 cwd 对应的**工作区**（`@deepseek-ai/dsh-workspace` 的 `attachSession`），web 侧栏因此能把 TUI 会话归到对应工作区分组，而不是留在「未分组」；只登记已存在的工作区，不创建/改名/排序。
@@ -101,6 +102,7 @@ dsh-orca
 | `/usage` | 查看 token 用量 |
 | `/yolo [on|off]` | 工具审批自动放行 |
 | `/permission [档位]` | 无参 = 本地审批策略 + 内核档位报告；带参 = 委托内核 `dsh-permission-presets` 切换档位（`read-only` / `workspace-write` / `danger-full-access`） |
+| `/perms [list\|allow\|deny\|ask\|rm\|reads\|reload]` | **本地审批规则层**（别名 `/rules`）。无参 = 列表（编号、来源、判定优先级说明）；`/perms allow bash(npm test:*) --reason 常用测试` 写入**项目**规则文件（`--user` 写用户级、`--session` 只在本会话生效）；`/perms rm <编号>` 删除（内置规则不可单删，用 `reads off`）；`/perms reads on\|off` 切换只读免问；`/perms reload` 重读文件。`allow *` 会被拒绝——整机放行请用 `/yolo` |
 | `/img <路径>` | 附加本地图片 |
 | `/todo` | 查看待办（真源是模型的 `todo_write`）；`add/set/done/undo/del/clear` 会把指令作为消息交给模型改写，Orca 不在本地伪造列表 |
 | `/ask <问题>` | 向 agent 提问，本轮只回答不执行工具 |
@@ -141,6 +143,8 @@ dsh-orca
 | `ORCA_WORKSPACE_FILE` | 覆盖工作区账本路径（漂移守卫读它；测试用） |
 | `ORCA_SETTINGS_FILE` | 覆盖本地设置文件路径 |
 | `ORCA_COMMANDS_DIR` | 覆盖自定义命令目录（默认 `<cwd>/.orca/commands`；用户级固定为 `$DSH_HOME/orca/commands`） |
+| `ORCA_PERMISSIONS_FILE` | 覆盖**项目**审批规则文件（默认 `<cwd>/.orca/permissions.json`） |
+| `ORCA_PERMISSIONS_USER_FILE` | 覆盖**用户**审批规则文件（默认 `$DSH_HOME/orca/permissions.json`）；测试/探针靠这两个变量把规则写到临时目录，绝不碰你真实的规则 |
 | `ORCA_DSH_PKG` | 探针用：显式指定 `@deepseek-ai/dsh` 的 `package.json`（默认按 PATH 上的 `dsh` 定位，避免命中陈旧的 hoisted 副本） |
 | `ORCA_PROBE_DIR` | 探针产物目录，默认 `<仓库>/.probe` |
 | `ORCA_E2E_CWD` | 探针的工作目录，默认取工作区账本里第一个已登记路径 |
@@ -177,7 +181,7 @@ dsh --profile orca
 
 ## 状态与路线图
 
-已完成：骨架与生命周期 → 真实内核闭环（流式增量、工具卡片、审批配对）→ 视觉层（主题 token、markdown、代码高亮、diff）→ 会话层（`/resume` 浏览、标题、`/compact`、双击 Esc 回退、durable 模型选择、工作区归属）→ 壳层（状态槽、附件通路、多行输入、跨平台剪贴板、全屏备用屏 + 鼠标选择/OSC 52 复制、Kitty 键盘协议、封存行滚入 scrollback）→ 内核真源对齐（三处影子实现改为委托：`/plan` 走 `dsh-plan-mode` + `exit_plan_mode` 评审面板、`/todo` 只读 + 指令交给模型、`/permission` 参数委托内核档位；`/` 菜单同名去重）→ 扩展入口（Skills 进菜单 + `/skills`、自定义 Markdown 命令与 `$ARGUMENTS`、菜单分区/子序列模糊匹配/内核 `input.hint`/忙时置灰）。
+已完成：骨架与生命周期 → 真实内核闭环（流式增量、工具卡片、审批配对）→ 视觉层（主题 token、markdown、代码高亮、diff）→ 会话层（`/resume` 浏览、标题、`/compact`、双击 Esc 回退、durable 模型选择、工作区归属）→ 壳层（状态槽、附件通路、多行输入、跨平台剪贴板、全屏备用屏 + 鼠标选择/OSC 52 复制、Kitty 键盘协议、封存行滚入 scrollback）→ 内核真源对齐（三处影子实现改为委托：`/plan` 走 `dsh-plan-mode` + `exit_plan_mode` 评审面板、`/todo` 只读 + 指令交给模型、`/permission` 参数委托内核档位；`/` 菜单同名去重）→ 扩展入口（Skills 进菜单 + `/skills`、自定义 Markdown 命令与 `$ARGUMENTS`、菜单分区/子序列模糊匹配/内核 `input.hint`/忙时置灰）→ 审批规则层（P1-1/P1-2：`/perms` 规则文件 + 面板编号直选/`Ctrl-E` 展开/只读免问；命中规则直接替内核应答，`deny` 恒定优先；8 条变异验证全红）。
 
 未完成：
 

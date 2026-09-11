@@ -246,8 +246,8 @@ Orca 曾在三处**影子实现**内核已有的能力（**2026-09-11 已全部�
 
 | # | 事项 | 做法 | 依赖 | 估时 | 验证 |
 | --- | --- | --- | --- | --- | --- |
-| P1-1 | 审批规则层（影子，必须） | `~/.dsh/orca/permissions.json`：`{decision: allow\|deny\|ask, scope: session\|project\|user, pattern: 工具名(参数模式), reason}`；命中 allow/deny 直接替内核应答 `allowed-once`/`rejected`，命中 ask 才弹面板；会话级放行 = scope: session 的临时条目 | 内核无规则能力（L4），纯 TUI 实现 | M | 单测 + 假内核；真机长会话验证不再重复弹窗 |
-| P1-2 | 审批面板增强 | 编号直选（1/2/3）、`Ctrl-E` 展开参数/diff、只读工具默认免问、面板显示命中规则与来源 | P1-1 | S–M | 渲染回归 + 真机 |
+| P1-1 ✅ | 审批规则层（**2026-09-11 已实现**：`src/permission-rules.ts` 纯函数层 + `/perms` 命令） | 落点与预期一致，但拆成两级文件：用户 `$DSH_HOME/orca/permissions.json`（`--user`）+ 项目 `<cwd>/.orca/permissions.json`（默认，可提交）；条目 `{decision: allow\|deny\|ask, scope, pattern: 工具名(参数模式), reason}`；命中 allow/deny 直接替内核应答 `allowed-once`/`rejected`，未命中或 `ask` 才弹面板；会话级放行 = scope: session 的内存条目（面板按 `2`，或 `--session`）。判定恒定 `deny > ask > allow`，同档比 scope（builtin < user < project < session）；`allow *` 明确拒绝（整机放行走 `/yolo`）。坏文件**报错而不是静默忽略** | 内核无规则能力（L4），纯 TUI 实现 | M | ✅ 单测 `scripts/permissions.test.ts`（38 条全仓测试的一部分）+ 假内核 phase13 断言；`pnpm mutation` 8 条变异全红 |
+| P1-2 ✅ | 审批面板增强（**2026-09-11 已实现**） | 面板四项：`1` 放行单次 / `2` 本会话放行该工具 / `3` 总是放行**窄规则**（如 `bash(npm ci:*)`，写入项目规则文件）/ `4`·`Esc` 拒绝；`Ctrl-E` 展开完整参数（一行预览不足以批准一次写入）；只读工具默认免问（8 条内置 allow，`/perms reads off` 关，显式 deny 仍压过它）；命中 `ask` 规则时**面板内**写明「命中规则：…（来源）」，解释它为何压过了 allow | P1-1 | S–M | ✅ 假内核 phase13 断言（Ctrl-E 展开、编号直选、免问开关、面板文案）；`pnpm mutation` 覆盖 |
 | P1-3 | 并行工作台（**独立里程碑**） | 软探测 `ctx.subagents`（**可用 API：列直接子代理与整棵后代树，含 mode/activity/lineage；对续跑子代理 `sendMessage`（Queue/Steer 二选）；`interrupt` 运行中的后代**）+ `ctx.jobs` + workflow 事件，合成一个"工作台"面板：运行中/已完成的子代理与后台任务、可中断、可续跑、可跳看输出；转录里给子代理单独行类型而不是一张工具卡 | `dsh-subagent` / `tool-subagent-control` / `dsh-jobs-local` / `dsh-workflow`（base） | L | 真机：让模型开一个后台子代理 + 一个后台命令，面板可见并能中断/续跑 |
 | P1-4 | 后台任务面板 | `/jobs` 面板：`ctx.jobs.list/get` 快照、`read` 增量输出、`kill` 取消、`wait` 阻塞等待 | `dsh-jobs-local` + `tool-jobs`（base） | M | 真机跑一个长命令后台化 |
 | P1-5 | 会话导出与复制 | `/export` 读会话 JSONL（复用 `scripts/session-log.mjs` 的 zstd 多帧读取）生成 Markdown/JSON；`/copy` 复制上一条回复（OSC 52 或本地） | 无（自研；避开 web 依赖的 `session-log-export`） | M | 单测（读取器已有测试基础）+ 真机 |
@@ -389,6 +389,7 @@ ls "$(dirname "$(readlink -f "$(command -v dsh)")")/../node_modules/@deepseek-ai
 
 # 3) Orca 自己的主链路是否健康（零 API 调用）
 pnpm build && pnpm test && pnpm dev
+pnpm mutation   # 审批规则层的变异验证：把实现逐条改坏，对应断言必须变红（跑完/被杀都会还原源码）
 node scripts/probe-pty.mjs --state
 
 # 4) 会话日志取证（看 plan/mode、todo/write、model/selection、hook/* 是否落盘）
@@ -407,7 +408,7 @@ node scripts/inspect-session.mjs <session-id>
 | `/init` | 分析仓库生成指令文件 | 无 | **Build**（P0：模板 prompt + 提示重启/新会话） |
 | `/memory` | 浏览/编辑记忆文件 | 无 | **Build**（P0 后半：只读展示内核加载了哪些 `AGENTS.md`/`CLAUDE.md`，编辑交给编辑器） |
 | `/skills` `/reload-skills` `/skill-doctor`、`/name` | skill 目录与调用 | 手势可用、菜单不可见 | **Wire**（P0-4） |
-| `/permissions`、`/yolo`、`/auto`、`/sandbox` | 权限档位与规则 | 影子实现 | **Wire ✅（P0-1 已实现）** + **Build**（P1-1 规则层） |
+| `/permissions`、`/yolo`、`/auto`、`/sandbox` | 权限档位与规则 | 档位已 Wire（P0-1）；规则层已 Build（P1-1：`/perms` + 面板增强 P1-2） | **Wire ✅（P0-1 已实现）** + **Build ✅（P1-1/P1-2 已实现，2026-09-11）**；`/auto`、`/sandbox` 仍 Skip（内核档位 + `danger-full-access` 已覆盖） |
 | `/plan` | plan mode + 评审 | 影子实现 | **Wire ✅（P0-2 已实现）** |
 | `/tasks`、`Ctrl+T`、`/todo` | 任务清单 | 本地投影 | **Wire ✅（P0-3 已实现）**；结构化任务面板仍是 P1 |
 | `/agents` `/list-agents` `/subtask` `/btw` `/fork` `/branch`、`Ctrl+B` | 子代理与并行 | 无 | **Wire**（P1-3 并行工作台；`/fork` 走 `sessions.fork`） |
