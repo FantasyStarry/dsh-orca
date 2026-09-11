@@ -38,7 +38,7 @@ pnpm dev   # 假内核冒烟：TTY 渲染循环、键盘、多行编辑、鼠标
 pnpm test  # 生命周期 + 渲染回归 + 事件投影 + 选区几何/剪贴板
 ```
 
-改了内核接缝的投影就补 `scripts/channel.test.ts`，改了编辑器/选区几何就补 `scripts/render-regressions.ts` / `scripts/selection.test.ts`，改了自定义命令的解析/扫描就补 `scripts/commands.test.ts`——**新增断言要做变异验证**（先把实现改坏，确认断言真的会红，再改回来）。
+改了内核接缝的投影就补 `scripts/channel.test.ts`，改了编辑器/选区几何就补 `scripts/render-regressions.ts` / `scripts/selection.test.ts`，改了自定义命令的解析/扫描就补 `scripts/commands.test.ts`——**新增断言要做变异验证**（先把实现改坏，确认断言真的会红，再改回来）。这一步有驱动器：`pnpm mutation` 会逐条改坏实现、跑对应载体、要求**退出码非 0 且输出里出现这条断言自己的文案**，跑完（或中途被杀）都会把源码还原；改动了实现就要同步改那张变异表。
 
 涉及真实内核的改动，需在 profile 内实测：`dsh plugin --profile orca add .` → `dsh --profile orca`；能自动化的一律写进 `scripts/probe-pty.mjs`（真 ConPTY 驱动，`--state` 零 API 调用；`--features` / `--live` 各花一次最小调用），会话日志用 `scripts/inspect-session.mjs <session-id>` 取证。
 
@@ -61,7 +61,8 @@ pnpm test  # 生命周期 + 渲染回归 + 事件投影 + 选区几何/剪贴板
 | `src/custom-commands.ts` | 自定义命令（Markdown 提示词模板）的解析与扫描：frontmatter 子集、`db/migrate.md` → `/db:migrate` 命名空间、项目根优先、64KiB/256 条上限、`$ARGUMENTS` 展开；纯函数，单测在 `scripts/commands.test.ts` |
 | `src/kernel/types.ts` | 内核接缝类型镜像（唯一允许"像内核"的地方） |
 | `cordis.patch.yml` | Orca bundle patch：除自身行外还插入内核 `workspace` 行（`@deepseek-ai/dsh-workspace`，dsh-base 不含）与预设 roster |
-| `scripts/dev.ts` | 假内核冒烟 harness |
+| `scripts/dev.ts` | 假内核冒烟 harness（审批等待一律有界：挂死比失败更糟——变异跑一半被杀会把源码留在改坏状态） |
+| `scripts/mutation-check.mjs` | 变异验证驱动器（`pnpm mutation`）：逐条改坏实现、跑载体、要求对应断言变红；自愈上次被杀留下的变异，绝不把改坏的源码留在地上 |
 | `scripts/paths.mjs` | 探针共用路径解析（dsh 安装 / `DSH_HOME` / 产物目录 / 工作目录），禁止脚本里再出现本机绝对路径 |
 | `scripts/probe-pty.mjs` | 真 profile PTY 探针（`--state` / `--features` / `--live` / `--fullscreen`） |
 | `scripts/session-log.mjs` | 会话日志读取（`.jsonl.zstd` 多 zstd 帧） |

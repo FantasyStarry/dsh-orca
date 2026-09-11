@@ -47,6 +47,7 @@
     "test": "node --import tsx/esm --test scripts/lifecycle.test.ts scripts/render-regressions.ts scripts/channel.test.ts scripts/selection.test.ts scripts/commands.test.ts scripts/permissions.test.ts",
     "dev": "node --import tsx/esm scripts/dev.ts",
     "probe:scrollback": "node scripts/probe-scrollback.mjs",
+    "mutation": "node scripts/mutation-check.mjs",
     "prepublishOnly": "pnpm build && pnpm test"
   },
   "peerDependencies": {
