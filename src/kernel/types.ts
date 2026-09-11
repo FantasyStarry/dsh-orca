@@ -714,6 +714,8 @@ export interface KernelSessionTitleService {
 export interface KernelCommandDescriptor {
   readonly name: string
   readonly description: string
+  /** Optional free-form input hint advertised to capable clients. */
+  readonly input?: { readonly hint?: string; readonly attachments?: boolean }
 }
 
 export interface KernelCommandExecution {
@@ -739,6 +741,30 @@ export interface KernelCommandsService {
     submittedAttachments: readonly KernelCommandSubmitAttachment[],
     signal: AbortSignal,
   ): Promise<KernelCommandExecution | undefined>
+}
+
+/**
+ * Skill registry seam (`ctx.skills`, dsh-skill `SkillRegistry`). The registry
+ * merges every provider's catalog and exposes invocation-neutral summaries;
+ * the CALLER applies the invocation policy, so a human-facing surface reads
+ * `invocation.userInvocable` and never touches the model-facing flags.
+ * Lookup is cwd-sensitive (project roots) and asynchronous; `scope` (the
+ * agent's layer chain) is deliberately NOT passed — Orca is a host row and
+ * reads the global layer, which is where the filesystem provider's local
+ * skills live. Checked against @deepseek-ai/dsh-skill 0.1.5-rc.2.
+ */
+export interface KernelSkillSummary {
+  readonly name: string
+  readonly description: string
+  readonly whenToUse?: string
+  readonly invocation: { readonly modelInvocable: boolean; readonly userInvocable: boolean }
+  /** Discovery origin (e.g. `project-agents`, `user-dsh`, `bundled`). */
+  readonly source: string
+  readonly provider: string
+}
+
+export interface KernelSkillsService {
+  list(options?: { readonly cwd?: string; readonly signal?: AbortSignal }): Promise<readonly KernelSkillSummary[]>
 }
 
 /**
@@ -923,6 +949,7 @@ export type KernelAppExit = (code: number) => void
  *   live model-stream publication; agent-scoped)
  * - `approval/request` → `(req, next)` waterfall (scoped to the agent)
  * - `commands/change` → `()` emit (command list changed)
+ * - `skills/change` → `()` emit (skill catalog invalidated; refetch)
  * Payloads are parsed defensively either way.
  */
 export const KERNEL_EVENTS = {
@@ -933,4 +960,5 @@ export const KERNEL_EVENTS = {
   agentError: 'agent/error',
   approvalRequest: 'approval/request',
   commandsChange: 'commands/change',
+  skillsChange: 'skills/change',
 } as const

@@ -22,10 +22,12 @@ orca / dsh-orca   # 均等价于 dsh --profile orca
 - 附件输入：`/img`（`/attach`）附加本地文件——图片走 `image` 块、其他文件走 `file` 块；`Ctrl+V` / `Alt+V` 粘贴图片，输入框内联 `[image #N]` / `[file #N]`，支持删除。剪贴板读取按平台走现成工具（Windows PowerShell、macOS `pngpaste`/`pbpaste`、Linux `wl-paste`/`xclip`），缺工具时降级为一句提示，绝不阻塞 TUI
 - `@` 文件补全
 - 多行输入：`Alt+Enter`（`Shift+Enter` / `Ctrl+J` 同义）换行，长行按 cell 软换行，编辑框随内容长高（上限 8 行，超出时底边提示 `↑/↓ N 行`）；`↑`/`↓` 在文本内移动光标，只在首/末行才召回历史；`Home/End`/`Ctrl+A`/`Ctrl+E`/`Ctrl+U`/`Ctrl+K` 都是行内语义
-- 待办列表：`/todo`
-- 内核命令自动并入 `/` 菜单（真实 profile 里的 `/goal`、`/feedback` 等），并跟随 `commands/change` 实时刷新
-- Agent 提问：支持官方 `ctx.userQuestions`，picker 单选/多选/自定义回答
-- Plan 模式：`/plan` 只规划不执行
+- 待办列表：`/todo`（只读展示模型持有的 `todo_write` 列表；编辑指令交给模型，本地不伪造真源）
+- Skills：启动即读内核 `ctx.skills` 的用户可调用目录，`/` 菜单按「Skills」分组列出（输入 `/名字` 直接调用，内核 `/name` 手势负责注入正文），`/skills` 打印完整目录与来源
+- 自定义命令：`<cwd>/.orca/commands/**/*.md`（项目）与 `$DSH_HOME/orca/commands`（用户）里的 Markdown 提示词模板——`db/migrate.md` → `/db:migrate`，支持 `description` / `argument-hint` frontmatter 与 `$ARGUMENTS` 展开；菜单里按「自定义」分组，命中后展开成一条普通消息（附件照常随行）
+- 内核命令自动并入 `/` 菜单（真实 profile 里的 `/goal`、`/feedback` 等），并跟随 `commands/change` 实时刷新；与本地同名时只显示一次，本地处理器负责把参数**委托**给内核命令
+- Agent 提问：支持官方 `ctx.userQuestions`，picker 单选/多选/自定义回答（`standard` preset 自带 `ask_user_question`）
+- Plan 模式：`/plan` 走**内核** `dsh-plan-mode`（状态落 `plan/mode` 日志），计划由 `exit_plan_mode` 提交后进入评审面板：Approve / Keep planning / 直接反馈；`Esc` = 插话（模型的 `exit_plan_mode` 调用会带着"用户想插话"的理由失败，模型留在 plan 模式）
 - 自更新：`orca update` / `/update`
 - 页脚 Nerd Font 分支图标：`/nerdfont`
 - 全屏备用屏模式（`--fullscreen`）：转录区成滑动窗口，**鼠标拖拽选择 + 释放即复制**（OSC 52），滚轮上下滚动；inline 模式不接管鼠标，终端原生选择照旧可用（全屏下要原生选择请按住 Shift 拖拽）
@@ -57,11 +59,9 @@ npm install -g dsh-orca
 dsh plugin --profile orca add dsh-orca
 ```
 
-如果希望 agent 能主动提问，还需要挂载官方提问工具：
+### 关于 agent 主动提问
 
-```sh
-dsh plugin --profile orca add @deepseek-ai/dsh-tool-ask-user
-```
+不需要额外装插件：Orca 默认挂载的 `standard`（以及 `ptc`、`cordis`）preset 自带 `tool-ask-user`，所以模型可以 `ask_user_question`，Orca 会把它渲染成可选项 + 自定义回答的面板（`minimal` preset 是固定的两工具训练配置，不带提问工具；`/preset` 可切换）。
 
 ## 使用
 
@@ -100,12 +100,13 @@ dsh-orca
 | `/compact [hint]` | 压缩上下文 |
 | `/usage` | 查看 token 用量 |
 | `/yolo [on|off]` | 工具审批自动放行 |
-| `/permission` | 查看审批策略 |
+| `/permission [档位]` | 无参 = 本地审批策略 + 内核档位报告；带参 = 委托内核 `dsh-permission-presets` 切换档位（`read-only` / `workspace-write` / `danger-full-access`） |
 | `/img <路径>` | 附加本地图片 |
-| `/todo` | 查看/编辑待办（list/add/done/undo/del/clear） |
+| `/todo` | 查看待办（真源是模型的 `todo_write`）；`add/set/done/undo/del/clear` 会把指令作为消息交给模型改写，Orca 不在本地伪造列表 |
 | `/ask <问题>` | 向 agent 提问，本轮只回答不执行工具 |
-| `/plan [on|off]` | 切换 Plan 模式 |
+| `/plan [on\|off\|toggle\|<指令>]` | 切换**内核** plan 模式（状态落在会话日志 `plan/mode`，resume/fork 可恢复）；模型完成任务后会用 `exit_plan_mode` 提交计划，Orca 渲染成评审面板（Approve / Keep planning / 反馈）。工具边界由审批与沙箱负责，不在客户端拦截 |
 | `/nerdfont [on|off]` | 切换 Nerd Font 分支图标 |
+| `/skills` | 列出可用 skill（用户可调用目录 + 来源；另有 N 个仅模型可用） |
 | `/update` | 检查并更新 dsh-orca |
 
 ### 快捷键
@@ -139,6 +140,7 @@ dsh-orca
 | `ORCA_LAST_SESSION_FILE` | 覆盖 last-session 标记文件路径 |
 | `ORCA_WORKSPACE_FILE` | 覆盖工作区账本路径（漂移守卫读它；测试用） |
 | `ORCA_SETTINGS_FILE` | 覆盖本地设置文件路径 |
+| `ORCA_COMMANDS_DIR` | 覆盖自定义命令目录（默认 `<cwd>/.orca/commands`；用户级固定为 `$DSH_HOME/orca/commands`） |
 | `ORCA_DSH_PKG` | 探针用：显式指定 `@deepseek-ai/dsh` 的 `package.json`（默认按 PATH 上的 `dsh` 定位，避免命中陈旧的 hoisted 副本） |
 | `ORCA_PROBE_DIR` | 探针产物目录，默认 `<仓库>/.probe` |
 | `ORCA_E2E_CWD` | 探针的工作目录，默认取工作区账本里第一个已登记路径 |
@@ -149,7 +151,7 @@ dsh-orca
 ```sh
 pnpm install
 pnpm build        # tsc → lib/
-pnpm test         # 生命周期 + 渲染回归 + 事件投影 + 选区/剪贴板（25 条）
+pnpm test         # 生命周期 + 渲染回归 + 事件投影 + 选区/剪贴板 + 自定义命令（30 条）
 pnpm dev          # 假内核冒烟测试（12 个 phase）
 ```
 
@@ -175,12 +177,14 @@ dsh --profile orca
 
 ## 状态与路线图
 
-已完成：骨架与生命周期 → 真实内核闭环（流式增量、工具卡片、审批配对）→ 视觉层（主题 token、markdown、代码高亮、diff）→ 会话层（`/resume` 浏览、标题、`/compact`、双击 Esc 回退、durable 模型选择、工作区归属）→ 壳层（状态槽、附件通路、多行输入、跨平台剪贴板、全屏备用屏 + 鼠标选择/OSC 52 复制、Kitty 键盘协议、封存行滚入 scrollback）。
+已完成：骨架与生命周期 → 真实内核闭环（流式增量、工具卡片、审批配对）→ 视觉层（主题 token、markdown、代码高亮、diff）→ 会话层（`/resume` 浏览、标题、`/compact`、双击 Esc 回退、durable 模型选择、工作区归属）→ 壳层（状态槽、附件通路、多行输入、跨平台剪贴板、全屏备用屏 + 鼠标选择/OSC 52 复制、Kitty 键盘协议、封存行滚入 scrollback）→ 内核真源对齐（三处影子实现改为委托：`/plan` 走 `dsh-plan-mode` + `exit_plan_mode` 评审面板、`/todo` 只读 + 指令交给模型、`/permission` 参数委托内核档位；`/` 菜单同名去重）→ 扩展入口（Skills 进菜单 + `/skills`、自定义 Markdown 命令与 `$ARGUMENTS`、菜单分区/子序列模糊匹配/内核 `input.hint`/忙时置灰）。
 
 未完成：
 
 - `--doctor` 自检：一键打印内核版本、各软探测接缝的在位情况、工作区漂移状态（现在只能翻日志）
 - 极窄终端（< 40 列）下的布局取舍
+
+对标 Claude Code / Kimi Code 的完整差距盘点（十域矩阵 + 差距分级 + 优先级路线图 + 证据复现命令）见 [`docs/planning/parity-gap-claude-code-kimi-code.md`](docs/planning/parity-gap-claude-code-kimi-code.md)——上面这份"未完成"清单是它的子集。
 
 ## 项目结构
 
@@ -200,6 +204,7 @@ scripts/
   lifecycle.test.ts   # 插件生命周期（装配/dispose/竞态）
   render-regressions.ts # 帧构建回归（净化/宽字符/多行编辑/全屏滚动）
   channel.test.ts     # session/event → 转录行投影
+  commands.test.ts    # 自定义命令：frontmatter / 命名空间 / 扫描优先级 / $ARGUMENTS
   selection.test.ts   # 备用屏选区几何 + 剪贴板降级 + file:// 解析
   probe-pty.mjs       # 真 PTY 探针（--state / --features / --live）
   session-log.mjs     # 会话日志读取（zstd 多帧）

@@ -977,6 +977,38 @@ try {
   await settle()
   assertInputBox('内核命令菜单关闭后', '')
 
+  // ── step 3c: Orca DELEGATES kernel-owned commands instead of shadowing ──
+  // A bare `/permission` must reach the kernel registry (dsh-permission-
+  // presets): the `› /permission` row is Orca's projection of the kernel's own
+  // `command/run` event, so it can only appear when `commands.execute`
+  // admitted the line. (Before the 2026-09 fix the local handler answered
+  // without ever calling the kernel.)
+  proc.write('/permission')
+  await settle(120)
+  proc.write('\r')
+  await waitMarker('内核 /permission 被委托', /› \/permission/)
+  await settle()
+  assertInputBox('权限命令后', '')
+  // `/todo` is READ-ONLY over the model-owned list: with no `todo/write` in
+  // this fresh session it must say so rather than inventing local state.
+  proc.write('/todo')
+  await settle(120)
+  proc.write('\r')
+  await waitMarker('待办只读展示', /暂无待办|待办（/)
+  await settle()
+  assertInputBox('待办查看后', '')
+
+  // ── step 3d: the human skill catalogue comes from the LIVE registry ──
+  // `/skills` reads `ctx.skills` on demand; the answer depends on what the
+  // machine has installed, so the assertion is tolerant: either a catalogue
+  // head, or the explicit "nothing user-invocable" notice.
+  proc.write('/skills')
+  await settle(120)
+  proc.write('\r')
+  await waitMarker('skill 目录', /可用 skill|暂无可用 skill/)
+  await settle()
+  assertInputBox('skill 目录后', '')
+
   // ── step 4: CJK typing keeps the cursor math honest ──
   proc.write('你好orca')
   await settle()

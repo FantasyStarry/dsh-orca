@@ -44,7 +44,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --import tsx/esm --test scripts/lifecycle.test.ts scripts/render-regressions.ts scripts/channel.test.ts scripts/selection.test.ts",
+    "test": "node --import tsx/esm --test scripts/lifecycle.test.ts scripts/render-regressions.ts scripts/channel.test.ts scripts/selection.test.ts scripts/commands.test.ts",
     "dev": "node --import tsx/esm scripts/dev.ts",
     "probe:scrollback": "node scripts/probe-scrollback.mjs",
     "prepublishOnly": "pnpm build && pnpm test"

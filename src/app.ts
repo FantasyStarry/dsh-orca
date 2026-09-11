@@ -27,6 +27,8 @@ import { randomUUID } from 'node:crypto'
 import { existsSync, readFileSync, readdirSync, unlinkSync, appendFileSync, writeFileSync } from 'node:fs'
 import { basename, isAbsolute, join, resolve } from 'node:path'
 import { readClipboard } from './clipboard.js'
+import { expandCustomCommand, readCustomCommands } from './custom-commands.js'
+import type { CustomCommand } from './custom-commands.js'
 import { Channel, isStreamChunk } from './adapter/channel.js'
 import type { SessionRoute } from './adapter/channel.js'
 import type { OrcaConfig } from './index.js'
@@ -59,12 +61,12 @@ import type {
   KernelSessionQueryService,
   KernelSessionTitleService,
   KernelSessionsService,
+  KernelSkillsService,
   KernelWorkspace,
   KernelWorkspaceRegistry,
   Session,
   SessionEvent,
   StreamChunk,
-  TodoItem,
   UserMessage,
 } from './kernel/types.js'
 import { KERNEL_EVENTS } from './kernel/types.js'
@@ -149,12 +151,13 @@ const SLASH_COMMANDS: readonly SlashCommand[] = [
   { name: 'compact', aliases: [], group: '会话', description: '压缩上下文（可附 hint）', idleOnly: true },
   { name: 'usage', aliases: [], group: '信息', description: '显示 token 用量明细' },
   { name: 'yolo', aliases: [], group: '模式', description: '审批全放行开关（on/off）' },
-  { name: 'permission', aliases: [], group: '模式', description: '查看当前审批策略' },
+  { name: 'permission', aliases: [], group: '模式', description: '查看/切换权限档位（内核预设）' },
   { name: 'nerdfont', aliases: ['branch-icon'], group: '界面', description: '切换页脚 git 分支 Nerd Font 图标（on/off，无参切换）' },
+  { name: 'skills', aliases: [], group: '扩展', description: '列出可用 skill（输入 /名字 直接调用）' },
   { name: 'update', aliases: ['upgrade'], group: '信息', description: '检查并更新 dsh-orca 到最新版' },
-  { name: 'todo', aliases: ['todos'], group: '任务', description: '查看/编辑待办（list/add/done/undo/del/clear）' },
+  { name: 'todo', aliases: ['todos'], group: '任务', description: '查看待办（编辑作为指令交给模型）' },
   { name: 'ask', aliases: [], group: '模式', description: '向 agent 提问（仅回答，不执行工具）' },
-  { name: 'plan', aliases: [], group: '模式', description: '切换 plan 模式（只规划，不执行工具）' },
+  { name: 'plan', aliases: [], group: '模式', description: '切换内核 plan 模式（计划需你批准）' },
 ]
 
 function findSlash(name: string): SlashCommand | undefined {
@@ -167,6 +170,30 @@ function parseSlash(text: string): { readonly name: string; readonly args: strin
   const space = text.indexOf(' ')
   if (space === -1) return { name: text.slice(1), args: '' }
   return { name: text.slice(1, space), args: text.slice(space + 1).trim() }
+}
+
+/** True when `query` occurs in `text` as an ordered subsequence. */
+function isSubsequence(query: string, text: string): boolean {
+  if (query === '') return true
+  let index = 0
+  for (const char of text) {
+    if (char === query[index]) index++
+    if (index >= query.length) return true
+  }
+  return false
+}
+
+/**
+ * Inline-menu rank for one candidate: 0 for an exact/prefix hit on the name or
+ * an alias, 1 for a subsequence hit (`/modl` finds `/model`), undefined for a
+ * miss. Lower sorts first; ties fall back to alphabetical order.
+ */
+function menuScore(name: string, aliases: readonly string[], query: string): number | undefined {
+  const candidates = [name, ...aliases]
+  if (query === '') return 0
+  if (candidates.some((candidate) => candidate.startsWith(query))) return 0
+  if (candidates.some((candidate) => isSubsequence(query, candidate))) return 1
+  return undefined
 }
 
 export function bootstrapApp(
@@ -242,6 +269,13 @@ export function bootstrapApp(
     ctx.get<KernelFileReferenceService>('fileReferences', false)
   const getWorkspaceRegistry = (): KernelWorkspaceRegistry | undefined =>
     ctx.get<KernelWorkspaceRegistry>('workspaceRegistry', false)
+  /**
+   * Skill registry (`ctx.skills`, dsh-skill). The menu shows the USER-facing
+   * catalog (`invocation.userInvocable`); invoking one is still the kernel's
+   * `/name` gesture on a plain user message, so Orca only has to offer the
+   * name — it never loads or injects the body itself.
+   */
+  const getSkills = (): KernelSkillsService | undefined => ctx.get<KernelSkillsService>('skills', false)
 
   let handle: AgentHandle | null = null
   let agent: Agent | null = null
@@ -287,8 +321,15 @@ export function bootstrapApp(
   let approvalPolicy: KernelApprovalPolicy = 'ask'
   /** Yolo mode: auto-answer every approval ask with `allowed-once`. */
   let yoloMode = false
-  /** Plan mode: reject tool approvals so the agent only produces a plan. */
-  let planMode = false
+  /**
+   * Plan mode is KERNEL state (`dsh-plan-mode`): the log-only `plan/mode`
+   * event is the truth and `channel.planActive` folds it, so resume/fork
+   * recover it. Orca used to keep a local boolean that rejected every tool
+   * approval — that shadowed the kernel's reviewed exit (`exit_plan_mode`)
+   * and lost the state on resume. Enforcement is now where the kernel puts
+   * it: approval prompts and the sandbox, not a client-side veto.
+   */
+  const planActive = (): boolean => channel.planActive
   /** One-shot ask mode: the current `/ask` turn should answer without tools. */
   let askMode = false
   /**
@@ -386,8 +427,10 @@ export function bootstrapApp(
     reason: string,
     signal: AbortSignal | undefined,
   ): Promise<'allowed-once' | 'rejected' | 'cancelled'> => {
-    // Plan/ask modes block tool execution by rejecting approvals before yolo.
-    if (planMode || askMode) return Promise.resolve('rejected')
+    // Ask mode blocks tool execution by rejecting approvals before yolo;
+    // plan mode deliberately does NOT (kernel plan mode keeps every tool
+    // callable and lets approvals/sandbox own enforcement).
+    if (askMode) return Promise.resolve('rejected')
     // Yolo: auto-allow without ever showing the panel.
     if (yoloMode) return Promise.resolve('allowed-once')
     if (disposed) return Promise.resolve('cancelled')
@@ -471,6 +514,10 @@ export function bootstrapApp(
     images: readonly ImageAttachmentRef[] = [],
     files: readonly FileAttachmentRef[] = [],
   ): void => {
+    // A user-authored command REWRITES the outgoing text (its body is the
+    // prompt); everything below then treats it as an ordinary message, so
+    // attachments ride along and the transcript shows the expanded prompt.
+    let outgoing = text
     const slash = parseSlash(text.trim())
     if (slash) {
       const cmd = findSlash(slash.name)
@@ -484,29 +531,37 @@ export function bootstrapApp(
         dispatchSlash(cmd.name, slash.args)
         return
       }
-      // Unknown slash: try the kernel-owned registry (e.g. commands
-      // registered by plugins, including /compact's owner). Admission misses
-      // resolve to undefined and fall through to a normal prompt — the kimi
-      // behavior. Attachments are NOT forwarded: `CommandSubmitAttachment`
-      // wants either base64 image bytes (we hold durable refs) or a STAGED
-      // file receipt minted by the session upload owner, which an out-of-tree
-      // TUI has no way to obtain. A miss therefore re-sends them as a prompt.
-      const registry = agent ? getCommands() : undefined
-      if (agent && registry) {
-        const line = text.trim()
-        void (async (): Promise<void> => {
-          try {
-            const execution = await registry.execute(agent, line, [], new AbortController().signal)
-            if (execution === undefined) {
-              agent.followup(buildUserMessage(text, images, files))
-            } else if (files.length > 0 || images.length > 0) {
-              channel.pushSystem('提示：内核命令不接收 Orca 的附件，本条命令未附带附件')
+      const custom = findCustomCommand(slash.name)
+      if (custom) {
+        outgoing = expandCustomCommand(custom, slash.args)
+        channel.pushSystem(`已展开自定义命令 /${custom.name}${custom.path ? `（${shortPath(custom.path)}）` : ''}`)
+      } else {
+        // Unknown slash: try the kernel-owned registry (e.g. commands
+        // registered by plugins, including /compact's owner). Admission misses
+        // resolve to undefined and fall through to a normal prompt — the kimi
+        // behavior. Attachments are NOT forwarded: `CommandSubmitAttachment`
+        // wants either base64 image bytes (we hold durable refs) or a STAGED
+        // file receipt minted by the session upload owner, which an out-of-tree
+        // TUI has no way to obtain. A miss therefore re-sends them as a prompt
+        // (and a name that is a user-invocable skill reaches the kernel's
+        // `/name` gesture the same way).
+        const registry = agent ? getCommands() : undefined
+        if (agent && registry) {
+          const line = text.trim()
+          void (async (): Promise<void> => {
+            try {
+              const execution = await registry.execute(agent, line, [], new AbortController().signal)
+              if (execution === undefined) {
+                agent.followup(buildUserMessage(text, images, files))
+              } else if (files.length > 0 || images.length > 0) {
+                channel.pushSystem('提示：内核命令不接收 Orca 的附件，本条命令未附带附件')
+              }
+            } catch (error) {
+              channel.pushSystem(`命令执行失败：${error instanceof Error ? error.message : String(error)}`)
             }
-          } catch (error) {
-            channel.pushSystem(`命令执行失败：${error instanceof Error ? error.message : String(error)}`)
-          }
-        })()
-        return
+          })()
+          return
+        }
       }
       // No registry to ask — treat as a normal prompt (kimi fallback).
     }
@@ -520,7 +575,7 @@ export function bootstrapApp(
     // how to handle quoted paths with spaces). Deliberately IMAGE-only:
     // auto-attaching any existing path would hijack ordinary prompts such as
     // "README.md" — non-image files need the explicit `/img` (`/attach`).
-    const rawPath = text.trim()
+    const rawPath = outgoing.trim()
     const unquotedPath = rawPath.replace(/^"|"$/g, '').trim()
     if (
       images.length === 0 &&
@@ -533,7 +588,7 @@ export function bootstrapApp(
     }
     // No optimistic echo: the user row is projected from the kernel's
     // `user/message` event, so the transcript stays a pure log projection.
-    agent.followup(buildUserMessage(text, images, files))
+    agent.followup(buildUserMessage(outgoing, images, files))
   }
 
   const dispatchSlash = (name: string, args: string): void => {
@@ -569,10 +624,13 @@ export function bootstrapApp(
         doYolo(args)
         break
       case 'permission':
-        showPermission()
+        void doPermission(args)
         break
       case 'nerdfont':
         doNerdFont(args)
+        break
+      case 'skills':
+        void doSkills()
         break
       case 'update':
         void doUpdate(args)
@@ -584,7 +642,7 @@ export function bootstrapApp(
         doAsk(args)
         break
       case 'plan':
-        doPlan(args)
+        void doPlan(args)
         break
       default:
         channel.pushSystem(`未知命令：/${name}（/help 查看）`)
@@ -614,6 +672,27 @@ export function bootstrapApp(
         // Discovery is best-effort; local help stays usable.
       }
     }
+    // User-authored commands and skills are DYNAMIC, so they are listed here
+    // rather than in the static table (a long list is summarised; `/skills`
+    // prints the full catalogue).
+    refreshCustomCommands()
+    if (customCommands.length > 0) {
+      groups.set(
+        '自定义',
+        customCommands.map(
+          (command) =>
+            `/${command.name}${command.argumentHint ? ` ${command.argumentHint}` : ''} — ${command.description || '自定义命令'}`,
+        ),
+      )
+    }
+    refreshSkills()
+    if (skillItems.length > 0) {
+      const names = skillItems.map((skill) => `/${skill.name}`)
+      const shown = names.slice(0, 8).join(' ')
+      groups.set('Skills', [`${shown}${names.length > 8 ? ` …共 ${names.length} 个` : ''}（输入名字直接调用，/skills 看全部）`])
+    } else if (getSkills()) {
+      groups.set('Skills', ['未发现用户可调用的 skill（项目 .agents/skills 或 ~/.agents/skills）'])
+    }
     channel.pushSystem('可用命令：')
     for (const [group, lines] of groups) {
       channel.pushSystem(`【${group}】${lines.join(' · ')}`)
@@ -627,6 +706,31 @@ export function bootstrapApp(
     channel.pushSystem(
       `用量：↑${usage.input} 输入 · ↓${usage.output} 输出${usage.reasoning > 0 ? ` · ✻${usage.reasoning} 推理` : ''}${cache > 0 ? ` · ⇄${cache} 缓存` : ''} · ${usage.messages} 条 assistant 消息`,
     )
+  }
+
+  /**
+   * Execute one kernel-registered slash command through `ctx.commands`.
+   *
+   * `ran`         — the registry admitted the line; the command's own
+   *                 `command/run` + `command/done` events render the result.
+   * `missing`     — no `commands` service in this composition.
+   * `unregistered`— the kernel has no command by that name (or no agent yet).
+   *
+   * Delegation is the point: where the kernel owns state (`/permission`
+   * presets, `/plan` mode, `/goal`, `/compact`), Orca must not re-implement
+   * it locally — that is how the old shadow implementations drifted.
+   */
+  const runKernelCommand = async (line: string): Promise<'ran' | 'missing' | 'unregistered'> => {
+    if (!agent) return 'unregistered'
+    const registry = getCommands()
+    if (!registry) return 'missing'
+    try {
+      const execution = await registry.execute(agent, line, [], new AbortController().signal)
+      return execution === undefined ? 'unregistered' : 'ran'
+    } catch (error) {
+      channel.pushSystem(`命令执行失败：${error instanceof Error ? error.message : String(error)}`)
+      return 'ran'
+    }
   }
 
   const showPermission = (): void => {
@@ -645,6 +749,28 @@ export function bootstrapApp(
       }
     }
     channel.pushSystem(`审批策略：${approvalPolicy}${yoloMode ? ' · yolo 开' : ''}（approval 服务未挂载时为本地估计值）`)
+  }
+
+  /**
+   * Permission presets (sandbox mode + approval policy bound together) are
+   * KERNEL state owned by `dsh-permission-presets`, whose `/permission`
+   * command is the only thing that can switch them — so arguments are
+   * delegated and a bare `/permission` reports BOTH: Orca's folded approval
+   * policy (local explanation) and the kernel's current preset.
+   */
+  const doPermission = async (args: string): Promise<void> => {
+    const arg = args.trim()
+    if (arg !== '') {
+      const outcome = await runKernelCommand(`/permission ${arg}`)
+      if (outcome === 'missing') {
+        channel.pushSystem('commands 服务未挂载：无法切换权限档位（需 dsh-permission-presets + dsh-commands）')
+      } else if (outcome === 'unregistered') {
+        channel.pushSystem('内核未注册 /permission 命令（需挂载 dsh-permission-presets）')
+      }
+      return
+    }
+    showPermission()
+    await runKernelCommand('/permission')
   }
 
   const doYolo = (args: string): void => {
@@ -700,6 +826,38 @@ export function bootstrapApp(
     channel.pushSystem(next ? 'Nerd Font 分支图标已开启（页脚显示 ）' : 'Nerd Font 分支图标已关闭（仅显示分支名）')
   }
 
+  /**
+   * `/skills` — the human-facing skill catalog. Reads the registry LIVE
+   * (rather than the menu cache) so the answer is never stale, and lists only
+   * `userInvocable` entries: those are exactly the ones the kernel's `/name`
+   * gesture will honour in a user message.
+   */
+  const doSkills = async (): Promise<void> => {
+    const skills = getSkills()
+    if (!skills) {
+      channel.pushSystem('skills 服务未挂载：无法列出 skill（profile 需挂载 dsh-skill + dsh-skill-filesystem）')
+      return
+    }
+    try {
+      const catalogue = await skills.list({ cwd: process.cwd() })
+      const invocable = catalogue
+        .filter((skill) => skill.invocation.userInvocable)
+        .sort((a, b) => a.name.localeCompare(b.name))
+      const modelOnly = catalogue.length - invocable.length
+      if (invocable.length === 0) {
+        const suffix = modelOnly > 0 ? `（另有 ${modelOnly} 个仅供模型调用）` : ''
+        channel.pushSystem(`暂无可用 skill${suffix}：把 <name>/SKILL.md 放进项目 \`.agents/skills/\` 或 \`~/.agents/skills/\``)
+        return
+      }
+      channel.pushSystem(`可用 skill（${invocable.length}）${modelOnly > 0 ? ` · 另 ${modelOnly} 个仅供模型调用` : ''}：输入 /名字 直接调用`)
+      for (const skill of invocable) {
+        channel.pushSystem(`/${skill.name} — ${skill.description}${skill.source ? `（${skill.source}）` : ''}`)
+      }
+    } catch (error) {
+      channel.pushSystem(`skill 目录读取失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
   const doUpdate = async (_args: string): Promise<void> => {
     const current = currentOrcaVersion()
     channel.pushSystem(`当前版本：v${current}，正在检查最新版本...`)
@@ -724,10 +882,12 @@ export function bootstrapApp(
   const doTodo = (args: string): void => {
     const parts = args.trim().split(/\s+/).filter((part) => part !== '')
     const command = (parts[0] ?? 'list').toLowerCase()
+    const rest = parts.slice(1).join(' ').trim()
     const todos = channel.todos
+    const usage = '用法：/todo [list|add <内容>|set <内容>|done <编号>|undo <编号>|del <编号>|clear]（set 多项用 | 分隔）'
     const showList = (): void => {
       if (todos.length === 0) {
-        channel.pushSystem('暂无待办')
+        channel.pushSystem('暂无待办（待办由模型用 todo_write 维护）')
         return
       }
       const lines = todos.map((todo, index) => {
@@ -737,10 +897,26 @@ export function bootstrapApp(
       channel.pushSystem(`待办（${todos.length}）：`)
       for (const line of lines) channel.pushSystem(line)
     }
-    const update = (next: TodoItem[]): void => {
-      channel.todos = next
-      channel.version++
-      showList()
+    /**
+     * Hand the edit to the MODEL instead of mutating the projection: the list
+     * is whole-list-replace state owned by `todo_write`, and the kernel's
+     * invariant rejects a durable `todo/write` outside an open turn — so a
+     * client-side "edit" could never be a real write. The old local mutation
+     * silently lost every change on the next model write (and never reached
+     * the model at all).
+     */
+    const askModel = (instruction: string): void => {
+      channel.pushSystem('待办由模型持有（todo_write）：本条指令已作为消息交给模型改写。')
+      submit(`待办列表需要更新（请用 todo_write 重写整份列表）：${instruction}`)
+    }
+    const todoContentAt = (index: number): string | undefined => todos[index - 1]?.content
+    const checkIndex = (): number | null => {
+      const n = Number(parts[1])
+      if (!Number.isInteger(n) || n < 1 || n > todos.length) {
+        channel.pushSystem(`用法：/todo ${command} <编号>（1-${todos.length}）`)
+        return null
+      }
+      return n
     }
     switch (command) {
       case 'list':
@@ -748,47 +924,48 @@ export function bootstrapApp(
         showList()
         break
       case 'add': {
-        const text = parts.slice(1).join(' ').trim()
-        if (!text) {
+        if (!rest) {
           channel.pushSystem('用法：/todo add <内容>')
           return
         }
-        update([...todos, { content: text, status: 'pending' }])
+        askModel(`在原列表基础上追加一项「${rest}」，其余项保持不变。`)
+        break
+      }
+      case 'set': {
+        if (!rest) {
+          channel.pushSystem('用法：/todo set <内容>（多项用 | 或 Alt+Enter 换行分隔）')
+          return
+        }
+        // Split on newlines and `|` only: `/` and `;` are ordinary content in
+        // paths and code, so splitting on them would silently shred an item.
+        const items = rest.split(/[\n|]+/).map((item) => item.trim()).filter((item) => item !== '')
+        askModel(`把整份列表替换为：${items.map((item, index) => `${index + 1}. ${item}`).join('；')}。`)
         break
       }
       case 'done': {
-        const n = Number(parts[1])
-        if (!Number.isInteger(n) || n < 1 || n > todos.length) {
-          channel.pushSystem(`用法：/todo done <编号>（1-${todos.length}）`)
-          return
-        }
-        update(todos.map((todo, index) => (index === n - 1 ? { ...todo, status: 'completed' } : todo)))
+        const n = checkIndex()
+        if (n === null) return
+        askModel(`把第 ${n} 项「${todoContentAt(n) ?? ''}」标记为 completed。`)
         break
       }
       case 'undo': {
-        const n = Number(parts[1])
-        if (!Number.isInteger(n) || n < 1 || n > todos.length) {
-          channel.pushSystem(`用法：/todo undo <编号>（1-${todos.length}）`)
-          return
-        }
-        update(todos.map((todo, index) => (index === n - 1 ? { ...todo, status: 'pending' } : todo)))
+        const n = checkIndex()
+        if (n === null) return
+        askModel(`把第 ${n} 项「${todoContentAt(n) ?? ''}」改回 pending。`)
         break
       }
       case 'del':
       case 'delete': {
-        const n = Number(parts[1])
-        if (!Number.isInteger(n) || n < 1 || n > todos.length) {
-          channel.pushSystem(`用法：/todo del <编号>（1-${todos.length}）`)
-          return
-        }
-        update(todos.filter((_, index) => index !== n - 1))
+        const n = checkIndex()
+        if (n === null) return
+        askModel(`删除第 ${n} 项「${todoContentAt(n) ?? ''}」，其余项保持不变。`)
         break
       }
       case 'clear':
-        update([])
+        askModel('清空待办（写入空列表）。')
         break
       default:
-        channel.pushSystem('用法：/todo [list|add <内容>|done <编号>|undo <编号>|del <编号>|clear]')
+        channel.pushSystem(usage)
         break
     }
   }
@@ -804,19 +981,31 @@ export function bootstrapApp(
     submit(question, [])
   }
 
-  const doPlan = (args: string): void => {
-    const arg = args.trim().toLowerCase()
-    let next: boolean
-    if (arg === '' || arg === 'toggle') next = !planMode
-    else if (arg === 'on' || arg === '1' || arg === 'true') next = true
-    else if (arg === 'off' || arg === '0' || arg === 'false') next = false
-    else {
-      channel.pushSystem('用法：/plan [on|off]（无参切换）')
-      return
+  /**
+   * `/plan` delegates to the KERNEL plan mode (`dsh-plan-mode`). Its `/plan`
+   * command owns the state (a log-only `plan/mode` event the `plan`
+   * projection folds, so resume/fork recover it), injects the `plan:policy`
+   * prompt section, and pairs with the `exit_plan_mode` tool whose review
+   * arrives on the user-questions channel (see `showCurrentQuestion`). The
+   * old local boolean shadowed that command, so the reviewed exit could
+   * never run.
+   */
+  const doPlan = async (args: string): Promise<void> => {
+    const arg = args.trim()
+    const lower = arg.toLowerCase()
+    let line: string
+    if (lower === '' || lower === 'on') line = '/plan'
+    else if (lower === 'off') line = '/plan off'
+    else if (lower === 'toggle') line = planActive() ? '/plan off' : '/plan'
+    // Any other text is an INSTRUCTION: the kernel enters plan mode and
+    // steers the text as the next step's user message.
+    else line = `/plan ${arg}`
+    const outcome = await runKernelCommand(line)
+    if (outcome === 'missing') {
+      channel.pushSystem('commands 服务未挂载：无法切换 plan 模式（需 dsh-plan-mode + dsh-commands）')
+    } else if (outcome === 'unregistered') {
+      channel.pushSystem('内核未注册 /plan 命令（需挂载 dsh-plan-mode）')
     }
-    planMode = next
-    if (next) askMode = false
-    channel.pushSystem(next ? 'Plan 模式已开启：只规划，不执行工具' : 'Plan 模式已关闭：恢复正常执行')
   }
 
   // ── agent-initiated questions (ctx.userQuestions provider) ────────────────
@@ -827,19 +1016,30 @@ export function bootstrapApp(
     if (!item) return
     questionCustomMode = false
     questionDraftSelected = []
-    channel.pushSystem(`问题：${item.question}`)
-    if (item.detail) channel.pushSystem(`详情：${item.detail}`)
+    // `exit_plan_mode` reviews travel the SAME user-questions channel: the
+    // question carries `intent.kind = 'plan-review'`, the plan markdown is
+    // `detail`, and `intent.approve` names the approving option label. The
+    // plan is pushed as ordinary system rows (they wrap and reflow on
+    // resize) instead of a pre-rendered card, so nothing is truncated.
+    const review = item.intent?.kind === 'plan-review'
+    if (review) {
+      channel.pushSystem(item.question)
+      if (item.detail) channel.pushSystem(item.detail)
+    } else {
+      channel.pushSystem(`问题：${item.question}`)
+      if (item.detail) channel.pushSystem(`详情：${item.detail}`)
+    }
     if (item.options && item.options.length > 0) {
       pickerStage = { kind: 'question' }
       picker = openPicker(
-        `问题：${item.question}`,
+        review ? '计划评审' : `问题：${item.question}`,
         [
           ...item.options.map((option, index) => ({
             value: option.label,
             label: `${index + 1}. ${option.label}`,
             ...(option.description ? { hint: option.description } : {}),
           })),
-          { value: '__custom__', label: '自定义回答...' },
+          { value: '__custom__', label: review ? '给反馈让模型继续改...' : '自定义回答...' },
         ],
         undefined,
       )
@@ -898,10 +1098,23 @@ export function bootstrapApp(
 
   const cancelPendingQuestion = (): void => {
     if (!pendingQuestion) return
+    const item = pendingQuestion.request.questions[pendingQuestion.index]
     const reject = pendingQuestion.reject
     pendingQuestion = null
     questionCustomMode = false
     questionDraftSelected = []
+    // Esc during a plan review is the kernel's "dismissed to speak instead"
+    // path: the model must stay in plan mode and wait for the user's message.
+    // (The kernel wraps its own ASK_CANCELLED error here; an out-of-tree TUI
+    // cannot construct that type, so the message carries the same meaning.)
+    if (item?.intent?.kind === 'plan-review') {
+      reject(
+        new Error(
+          'The user dismissed the plan review to speak instead; stay in plan mode, stop here, and wait for their message.',
+        ),
+      )
+      return
+    }
     reject(new Error('ask_user_question was aborted before the user answered'))
   }
 
@@ -983,25 +1196,14 @@ export function bootstrapApp(
   }
 
   const doCompact = async (hint: string): Promise<void> => {
-    if (!agent) {
-      channel.pushSystem('agent 未就绪，无法压缩')
-      return
-    }
-    const commands = getCommands()
-    if (!commands) {
-      channel.pushSystem('commands 服务未挂载：无法执行 /compact（内核需挂载 dsh-command-compact）')
-      return
-    }
     const line = hint === '' ? '/compact' : `/compact ${hint}`
-    try {
-      const execution = await commands.execute(agent, line, [], new AbortController().signal)
-      if (execution === undefined) {
-        channel.pushSystem('内核未注册 /compact 命令')
-      }
-      // Success/failure rows arrive via command/done + compaction/* events.
-    } catch (error) {
-      channel.pushSystem(`压缩失败：${error instanceof Error ? error.message : String(error)}`)
+    const outcome = await runKernelCommand(line)
+    if (outcome === 'missing') {
+      channel.pushSystem('commands 服务未挂载：无法执行 /compact（内核需挂载 dsh-command-compact）')
+    } else if (outcome === 'unregistered') {
+      channel.pushSystem('内核未注册 /compact 命令')
     }
+    // Success/failure rows arrive via command/done + compaction/* events.
   }
 
   const releaseAgent = async (): Promise<void> => {
@@ -1483,8 +1685,12 @@ export function bootstrapApp(
     })
     agentListenerDisposers.push(disposeStream)
     // The registry is agent-scoped, so the command list is (re)discovered for
-    // every attached agent; `commands/change` keeps it fresh afterwards.
+    // every attached agent; `commands/change` keeps it fresh afterwards. The
+    // user-authored command tree and the skill catalogue are process-wide, so
+    // they are read once per attach (and throttled re-reads afterwards).
     refreshKernelCommands()
+    refreshCustomCommands(true)
+    refreshSkills()
   }
 
   // ── /model picker ─────────────────────────────────────────────────────────
@@ -1532,6 +1738,82 @@ export function bootstrapApp(
       refreshKernelCommands()
     }),
   )
+  // The skill registry invalidates its catalog on any provider/revision
+  // change and expects consumers to refetch for their own lookup options.
+  listenerDisposers.push(
+    ctx.on(KERNEL_EVENTS.skillsChange, () => {
+      skillsFetchedAt = 0
+      refreshSkills()
+    }),
+  )
+
+  /**
+   * User-authored commands (`.orca/commands/**` + `$DSH_HOME/orca/commands`).
+   * Re-scanned with a 1s cache so editing a file reaches the menu without a
+   * restart, while a keystroke-per-frame menu cannot hammer the filesystem.
+   * `ORCA_COMMANDS_DIR` overrides the project root (tests point it at a temp
+   * tree; a deployment can relocate it).
+   */
+  let customCommands: CustomCommand[] = []
+  let customCommandsReadAt = 0
+
+  const customCommandRoots = (): string[] => {
+    const override = process.env['ORCA_COMMANDS_DIR']
+    const project =
+      override !== undefined && override !== '' ? override : join(process.cwd(), '.orca', 'commands')
+    const home = process.env['DSH_HOME']
+    const userRoot =
+      home !== undefined && home !== ''
+        ? join(home, 'orca', 'commands')
+        : join(process.env['USERPROFILE'] ?? process.env['HOME'] ?? '', '.dsh', 'orca', 'commands')
+    return [project, userRoot]
+  }
+
+  const refreshCustomCommands = (force = false): void => {
+    const now = Date.now()
+    if (!force && now - customCommandsReadAt < 1000) return
+    customCommandsReadAt = now
+    customCommands = readCustomCommands(customCommandRoots())
+  }
+
+  const findCustomCommand = (name: string): CustomCommand | undefined => {
+    refreshCustomCommands()
+    const lower = name.toLowerCase()
+    return customCommands.find((command) => command.name.toLowerCase() === lower)
+  }
+
+  /**
+   * User-invocable skills from the kernel skill registry (dsh-skill). The
+   * fetch is asynchronous (providers may touch the filesystem), so the menu
+   * renders this cache and a landed fetch bumps the channel version to
+   * repaint. A failing provider keeps the last good catalogue — discovery is
+   * best-effort by contract, exactly like the kernel's own consumer.
+   */
+  let skillItems: readonly { readonly name: string; readonly description: string; readonly source: string }[] = []
+  let skillsFetchedAt = 0
+  let skillsFetching = false
+
+  const refreshSkills = (): void => {
+    const skills = getSkills()
+    if (!skills || skillsFetching) return
+    if (Date.now() - skillsFetchedAt < 5000) return
+    skillsFetching = true
+    void (async (): Promise<void> => {
+      try {
+        const catalogue = await skills.list({ cwd: process.cwd() })
+        skillItems = catalogue
+          .filter((skill) => skill.invocation.userInvocable)
+          .map((skill) => ({ name: skill.name, description: skill.description, source: String(skill.source ?? '') }))
+          .sort((a, b) => a.name.localeCompare(b.name))
+        skillsFetchedAt = Date.now()
+        channel.version++
+      } catch {
+        // Keep the last good catalogue; the menu simply stays as it was.
+      } finally {
+        skillsFetching = false
+      }
+    })()
+  }
 
   const menuMatches = (editorText: string): PickerItem[] => {
     // Attachment tokens share the editor with the command text; the menu is
@@ -1539,13 +1821,98 @@ export function bootstrapApp(
     const plain = stripAttachmentTokens(editorText)
     if (!plain.startsWith('/') || plain.includes(' ')) return []
     const prefix = plain.slice(1).toLowerCase()
-    const local = SLASH_COMMANDS.filter(
-      (cmd) => cmd.name.startsWith(prefix) || cmd.aliases.some((alias) => alias.startsWith(prefix)),
-    ).map((cmd) => itemOf(`/${cmd.name}`, cmd.name, cmd.description))
-    const kernel = kernelCommands
-      .filter((descriptor) => descriptor.name.toLowerCase().startsWith(prefix))
-      .map((descriptor) => itemOf(`/${descriptor.name}`, descriptor.name, descriptor.description))
-    return [...local, ...kernel]
+    // A file edit should reach the menu without a restart, and the catalog is
+    // fetched once per menu generation at most (both are throttled).
+    refreshCustomCommands()
+    refreshSkills()
+    const idle = channel.runState === 'idle'
+    const ranked: { readonly score: number; readonly item: PickerItem }[] = []
+    for (const cmd of SLASH_COMMANDS) {
+      const score = menuScore(cmd.name, cmd.aliases, prefix)
+      if (score === undefined) continue
+      ranked.push({
+        score,
+        item: {
+          value: cmd.name,
+          label: `/${cmd.name}`,
+          ...(cmd.description === '' ? {} : { hint: cmd.description }),
+          section: '本地',
+          // Idle-gated commands stay VISIBLE mid-turn but unselectable, so the
+          // menu explains the refusal up front (Enter prints the reason).
+          ...(cmd.idleOnly === true && !idle ? { disabled: true } : {}),
+        },
+      })
+    }
+    // User-authored Markdown commands: they expand into a prompt, so they are
+    // offered under their own heading and may intentionally shadow a kernel
+    // command of the same name.
+    for (const command of customCommands) {
+      const score = menuScore(command.name, [], prefix)
+      if (score === undefined) continue
+      ranked.push({
+        score,
+        item: {
+          value: command.name,
+          label: `/${command.name}${command.argumentHint ? ` ${command.argumentHint}` : ''}`,
+          hint: command.description === '' ? '自定义命令' : command.description,
+          section: '自定义',
+        },
+      })
+    }
+    // Kernel commands append after ours and never duplicate a name already
+    // offered (Orca's own handlers delegate to the kernel command of the same
+    // name — `/compact`, `/permission`, `/plan` — and a custom command is an
+    // explicit user override).
+    const customNames = new Set(customCommands.map((command) => command.name.toLowerCase()))
+    for (const descriptor of kernelCommands) {
+      const name = descriptor.name.toLowerCase()
+      if (findSlash(descriptor.name) !== undefined || customNames.has(name)) continue
+      const score = menuScore(name, [], prefix)
+      if (score === undefined) continue
+      ranked.push({
+        score,
+        item: {
+          value: descriptor.name,
+          label: `/${descriptor.name}${descriptor.input?.hint ? ` ${descriptor.input.hint}` : ''}`,
+          hint: descriptor.description,
+          section: '内核',
+        },
+      })
+    }
+    // Skills are invoked by NAME on a normal user message (the kernel's
+    // `dsh-tool-skill` gesture injects the body), so the menu only has to
+    // offer the token; a name already taken above would never reach it.
+    for (const skill of skillItems) {
+      const name = skill.name.toLowerCase()
+      if (findSlash(name) !== undefined || customNames.has(name)) continue
+      if (kernelCommands.some((descriptor) => descriptor.name.toLowerCase() === name)) continue
+      const score = menuScore(name, [], prefix)
+      if (score === undefined) continue
+      ranked.push({
+        score,
+        item: { value: skill.name, label: `/${skill.name}`, hint: skill.description, section: 'Skills' },
+      })
+    }
+    // Rank by match quality, then regroup into FIXED sections: a global sort
+    // would interleave the headings (every section change emits a header, so
+    // the window would fill with headers instead of commands). Within one
+    // section the relative order is the declaration order, except that prefix
+    // hits (score 0) precede subsequence hits (score 1).
+    ranked.sort((a, b) => a.score - b.score)
+    const bySection = new Map<string, PickerItem[]>()
+    for (const entry of ranked) {
+      const section = entry.item.section ?? ''
+      const list = bySection.get(section) ?? []
+      list.push(entry.item)
+      bySection.set(section, list)
+    }
+    const sections = ['本地', '自定义', '内核', 'Skills']
+    const ordered: PickerItem[] = []
+    for (const section of sections) ordered.push(...(bySection.get(section) ?? []))
+    for (const [section, items] of bySection) {
+      if (!sections.includes(section)) ordered.push(...items)
+    }
+    return ordered
   }
 
   const currentMenu = (): { readonly items: readonly PickerItem[]; readonly index: number } | null => {
@@ -1560,11 +1927,22 @@ export function bootstrapApp(
     if (!menu || menu.items.length === 0) return false
     const item = menu.items[menu.index]
     if (!item) return false
+    if (item.disabled === true) {
+      channel.pushSystem(`/${item.value} 需在空闲时执行，先按 Esc 打断当前回合`)
+      return true
+    }
     // Completing a command replaces the editor TEXT only: pending attachment
     // tokens stay put, AHEAD of it (they belong to the next message, not to
     // the command) — `menuMatches` strips them back out.
     const kept = Array.from(editor).filter(isAttachmentSentinel)
-    editor = `${kept.join('')}/${item.value}`
+    const completed = `${kept.join('')}/${item.value}`
+    // Already complete → let Enter DISPATCH. Without this, a fully typed
+    // kernel command, custom command or skill name re-completed itself
+    // forever and could never be run from the menu (kimi/Claude Code both
+    // dispatch on the second Enter, which only works because this returns
+    // false the second time).
+    if (completed === editor) return false
+    editor = completed
     cursorPos = codeLen(editor)
     menuIndex = 0
     return true
@@ -3178,7 +3556,7 @@ export function bootstrapApp(
       title,
       policy: approvalPolicy,
       yolo: yoloMode,
-      planMode,
+      planMode: planActive(),
       askMode,
       branch: gitBranch(cwd),
       nerdFont,

@@ -17,7 +17,7 @@
  */
 
 import { EventEmitter } from 'node:events'
-import { rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { bootstrapApp } from '../src/app.js'
@@ -33,6 +33,7 @@ import type {
   CreateAgentOptions,
   EpochHeader,
   KernelAgentsService,
+  KernelAskUserQuestionAnswer,
   KernelContext,
   ResumeAgentOptions,
   Session,
@@ -216,6 +217,10 @@ interface KernelRecord {
   policySet: string | null
   titleRenamed: string | null
   compactLine: string | null
+  /** Every line the kernel `commands` service admitted, in call order. */
+  commandLines: string[]
+  /** Agent-scoped `user-questions/request` listener (question + plan review). */
+  questionListener: ((...args: unknown[]) => unknown) | null
   forkCalled: { boundary: number | undefined; childId: string | undefined } | null
   presetMounted: string | null
   disposed: boolean
@@ -242,6 +247,8 @@ class FakeKernel implements KernelContext {
     policySet: null,
     titleRenamed: null,
     compactLine: null,
+    commandLines: [],
+    questionListener: null,
     forkCalled: null,
     presetMounted: null,
     disposed: false,
@@ -257,6 +264,8 @@ class FakeKernel implements KernelContext {
   hideSessionQuery = false
   /** When true, `workspaceRegistry` reads as unregistered (degradation probe). */
   hideWorkspaceRegistry = false
+  /** When true, the `skills` service reads as unregistered (degradation probe). */
+  hideSkills = false
   /**
    * The ONE directory the fake workspace owns; `undefined` models a cwd the
    * user never added as a workspace (the attach must then do nothing).
@@ -315,8 +324,17 @@ class FakeKernel implements KernelContext {
   /** When true, `agentPresets.mount` rejects (preset-failure fallback probe). */
   presetMountFails = false
   /** Kernel-registered commands beyond Orca's own table (menu discovery probe). */
-  extraCommands: Array<{ readonly name: string; readonly description: string }> = [
-    { name: 'goal', description: '目标模式' },
+  extraCommands: Array<{
+    readonly name: string
+    readonly description: string
+    readonly input?: { readonly hint?: string }
+  }> = [
+    { name: 'goal', description: '目标模式', input: { hint: '<目标>' } },
+    // Same names as Orca's own table: the kernel owns these (dsh-permission-
+    // presets / dsh-plan-mode), the local handlers delegate to them, and the
+    // `/` menu must list each name ONCE.
+    { name: 'permission', description: '切换权限档位' },
+    { name: 'plan', description: '计划模式' },
   ]
   /** Live agents by session id (removed on dispose, like the real store). */
   private readonly liveAgents = new Map<string, AgentHandle['agent']>()
@@ -404,17 +422,44 @@ class FakeKernel implements KernelContext {
       } as T
     }
     if (name === 'commands') {
+      const kernel = this
+      const descriptors = (): Array<{ name: string; description: string }> => [
+        { name: 'compact', description: '压缩上下文' },
+        ...this.extraCommands,
+      ]
       return {
-        list: () => [
-          { name: 'compact', description: '压缩上下文' },
-          // Not in Orca's own table: it must surface in the `/` menu.
-          ...this.extraCommands,
-        ],
-        find: (_agent: unknown, cmdName: string) => (cmdName === 'compact' ? { name: 'compact' } : undefined),
+        list: () => descriptors(),
+        find: (_agent: unknown, cmdName: string) => descriptors().find((entry) => entry.name === cmdName),
         execute: async (_agent: unknown, line: string) => {
-          this.record.compactLine = line
+          // The real registry admits only registered names; an unmatched line
+          // resolves `undefined` (Orca then falls back to a normal prompt).
+          const cmdName = line.trim().replace(/^\//, '').split(/\s+/)[0] ?? ''
+          if (!descriptors().some((entry) => entry.name === cmdName)) return undefined
+          kernel.record.commandLines.push(line)
+          if (cmdName === 'compact') kernel.record.compactLine = line
           return { commandId: 'cmd-1', result: { kind: 'success' as const, text: '压缩已开始' } }
         },
+      } as T
+    }
+    if (name === 'skills') {
+      if (this.hideSkills) return undefined
+      return {
+        list: async () => [
+          {
+            name: 'fake-skill-a',
+            description: '用户可调用的技能',
+            invocation: { modelInvocable: true, userInvocable: true },
+            source: 'project-agents',
+            provider: 'filesystem',
+          },
+          {
+            name: 'fake-skill-b',
+            description: '仅模型可见的技能',
+            invocation: { modelInvocable: true, userInvocable: false },
+            source: 'user-dsh',
+            provider: 'filesystem',
+          },
+        ],
       } as T
     }
     if (name === 'approval') {
@@ -601,6 +646,20 @@ class FakeKernel implements KernelContext {
   }
 
   /**
+   * Ask the plugin's registered user-questions provider the way the kernel
+   * does — the waterfall listener receives `(request, next)` and returns the
+   * answer (a promise while the human is still deciding). Used for both the
+   * plain `ask_user_question` shape and the `exit_plan_mode` review, which
+   * differs only by its `intent` tag.
+   */
+  askQuestion(request: Record<string, unknown>): Promise<KernelAskUserQuestionAnswer> {
+    const listener = this.record.questionListener
+    if (!listener) return Promise.reject(new Error('no user-questions listener registered'))
+    const result = listener(request, () => Promise.resolve({ answers: [] }))
+    return Promise.resolve(result as Promise<KernelAskUserQuestionAnswer>)
+  }
+
+  /**
    * Publish one kernel-lifecycle cordis event (NOT a session event) — the
    * shape `ctx.on(name, …)` listeners receive.
    */
@@ -683,6 +742,7 @@ class FakeKernel implements KernelContext {
             if (name === 'system-prompt/assemble') kernel.record.assembleListener = listener
             if (name === 'approval/request') kernel.record.approvalListener = listener
             if (name === 'agent/assistant-stream') kernel.record.streamListener = listener
+            if (name === 'user-questions/request') kernel.record.questionListener = listener
             return () => {}
           },
         },
@@ -1313,6 +1373,19 @@ async function main(): Promise<void> {
   )
   await sleep(250)
   const visible3 = (): string => stripSgr(writes3.join(''))
+  /**
+   * The renderer sediments sealed transcript rows into the stream a few lines
+   * per 33ms tick, so a screen assertion must POLL instead of assuming one
+   * sleep flushed everything (help blocks grew as commands gained detail).
+   */
+  const waitVisible = async (needle: string, budgetMs = 2500): Promise<boolean> => {
+    const deadline = Date.now() + budgetMs
+    while (Date.now() < deadline) {
+      if (visible3().includes(needle)) return true
+      await sleep(30)
+    }
+    return false
+  }
   const typeLine = async (line: string): Promise<void> => {
     for (const ch of line) stdin3.text(ch)
     stdin3.key('return')
@@ -1320,7 +1393,18 @@ async function main(): Promise<void> {
   }
 
   await typeLine('/help')
-  if (!visible3().includes('【任务】/todo') || !visible3().includes('/resume')) problems.push('phase3：/help 未列出会话命令')
+  // NOTE: these needles must stay CONTIGUOUS in the byte stream. A help line
+  // that no longer fits the terminal width is truncated, and the block then
+  // gets repainted across more than one write — a long command description
+  // can split 「【任务】」 from 「/todo」 and make this assertion flake. Keep
+  // command descriptions short (they are single-line UI copy anyway).
+  // NOTE: `/help` now spans many groups (local + custom + kernel + skills), so
+  // the sealed rows need a while to sediment through the 1:1 squeeze on a
+  // 24-row terminal — hence the longer budget on the LAST group's needle.
+  {
+    const okTodo = await waitVisible('【任务】/todo')
+    if (!okTodo) problems.push('phase3：/help 未列出扩展/任务分组')
+  }
   await typeLine('/usage')
   if (!visible3().includes('用量')) problems.push('phase3：/usage 未上屏')
   // Turn summary: one scripted turn settles a `✓ 本轮 · 用时 · tok/s` row.
@@ -1330,6 +1414,10 @@ async function main(): Promise<void> {
     problems.push('phase3：回合结束缺结算行（✓ 本轮 · 用时 · tok/s）')
   }
   if (!visible3().includes('⇄75 缓存')) problems.push('phase3：结算行缺缓存命中段')
+  // `/help` is taller than the terminal, so its middle sediments only after a
+  // following turn pushes those rows up: the session group is checked HERE
+  // rather than immediately after `/help` (see the note above).
+  if (!(await waitVisible('/resume', 3000))) problems.push('phase3：/help 未列出会话命令 /resume')
   await typeLine('/title 新标题')
   if (kernel3.record.titleRenamed !== '新标题') problems.push('phase3：/title 未调用 rename')
   if (!visible3().includes('标题已更新')) problems.push('phase3：/title 确认缺失')
@@ -1398,6 +1486,140 @@ async function main(): Promise<void> {
   }
   await typeLine('/permission')
   if (!visible3().includes('审批策略')) problems.push('phase3：/permission 未上屏')
+  // Kernel-owned presets: a bare `/permission` must ALSO report through the
+  // kernel command (the only thing that can switch the preset), and an
+  // argument must be delegated verbatim instead of being answered locally.
+  if (!kernel3.record.commandLines.includes('/permission')) {
+    problems.push(`phase3：/permission 未委托内核：${JSON.stringify(kernel3.record.commandLines)}`)
+  }
+  await typeLine('/permission read-only')
+  if (!kernel3.record.commandLines.includes('/permission read-only')) {
+    problems.push(`phase3：/permission 档位参数未委托内核：${JSON.stringify(kernel3.record.commandLines)}`)
+  }
+  // `/plan` is kernel state (dsh-plan-mode): delegation only, never a local
+  // flag. `on` folds to the bare command (the kernel treats any other non-empty
+  // argument as an INSTRUCTION to steer).
+  await typeLine('/plan on')
+  if (!kernel3.record.commandLines.includes('/plan')) {
+    problems.push(`phase3：/plan on 未委托内核 /plan：${JSON.stringify(kernel3.record.commandLines)}`)
+  }
+  await typeLine('/plan off')
+  if (!kernel3.record.commandLines.includes('/plan off')) {
+    problems.push(`phase3：/plan off 未委托内核：${JSON.stringify(kernel3.record.commandLines)}`)
+  }
+  await typeLine('/plan 只做调研')
+  if (!kernel3.record.commandLines.includes('/plan 只做调研')) {
+    problems.push(`phase3：/plan <指令> 未委托内核：${JSON.stringify(kernel3.record.commandLines)}`)
+  }
+  // Plan state is the LOG's (`plan/mode`), so it survives resume/fork and the
+  // footer badge must follow the event rather than any local flag.
+  kernel3.emit('plan/mode', { active: true })
+  await sleep(120)
+  if (!(await waitVisible('plan'))) problems.push('phase3：plan/mode 投影未进页脚')
+  kernel3.emit('plan/mode', { active: false })
+  await sleep(120)
+  // `/todo` is READ-ONLY over the model-owned list: edits are prompts that ask
+  // the model to rewrite it (the kernel invariant rejects a durable
+  // `todo/write` outside an open turn, so a client-side edit is not a write).
+  kernel3.emit('todo/write', {
+    todos: [
+      { content: '写文档', status: 'in_progress' },
+      { content: '跑测试', status: 'pending' },
+    ],
+  })
+  await sleep(120)
+  await typeLine('/todo')
+  if (!(await waitVisible('1. ◐ 写文档')) || !(await waitVisible('2. ○ 跑测试'))) {
+    problems.push('phase3：/todo 未列出投影真源')
+  }
+  await typeLine('/todo add 回归验证')
+  await sleep(150)
+  {
+    const block = kernel3.record.followupMessage?.content[0]
+    const text = block?.type === 'text' ? block.text : ''
+    if (!text.includes('todo_write') || !text.includes('回归验证')) {
+      problems.push(`phase3：/todo add 未作为指令交给模型：${JSON.stringify(text)}`)
+    }
+    if (visible3().includes('3. ○ 回归验证')) problems.push('phase3：/todo add 不应在本地伪造列表')
+  }
+  await typeLine('/todo done 2')
+  await sleep(150)
+  {
+    const block = kernel3.record.followupMessage?.content[0]
+    const text = block?.type === 'text' ? block.text : ''
+    if (!text.includes('第 2 项') || !text.includes('跑测试')) {
+      problems.push(`phase3：/todo done 未按编号生成指令：${JSON.stringify(text)}`)
+    }
+  }
+  // Plan review (`exit_plan_mode`) arrives on the SAME user-questions channel,
+  // tagged with `intent.kind = 'plan-review'`. Approving must send ONLY the
+  // approve label (the kernel requires selected==[approve] with no custom).
+  {
+    const pending = kernel3.askQuestion({
+      questions: [
+        {
+          id: 'plan-review',
+          header: 'Plan review',
+          question: 'Approve this plan and leave plan mode?',
+          detail: '# 计划\n\n1. 接线\n2. 验证',
+          options: [
+            { label: 'Approve', description: '退出 plan mode' },
+            { label: 'Keep planning', description: '继续规划' },
+          ],
+          intent: { kind: 'plan-review', approve: 'Approve' },
+        },
+      ],
+    })
+    await sleep(150)
+    if (!(await waitVisible('# 计划'))) problems.push('phase3：计划正文未上屏')
+    if (!(await waitVisible('计划评审'))) problems.push('phase3：评审面板标题缺失')
+    // The review must render as a PLAN (system rows), not as a generic
+    // question whose `detail` is prefixed with “详情：” — that prefix is the
+    // tell that the `plan-review` intent was ignored.
+    if (visible3().includes('详情：# 计划')) problems.push('phase3：计划评审被当成普通问题渲染')
+    stdin3.text('1')
+    stdin3.key('return')
+    await sleep(120)
+    const answer = await pending
+    const item = answer.answers.find((entry) => entry.id === 'plan-review')
+    if (!item || item.selected.length !== 1 || item.selected[0] !== 'Approve' || item.custom !== undefined) {
+      problems.push(`phase3：计划批准答案形状错误：${JSON.stringify(answer)}`)
+    }
+  }
+  // Esc during a plan review = the kernel's "dismissed to speak instead"
+  // signal: the ask must REJECT (not answer), so the model stays in plan mode.
+  {
+    let rejected = ''
+    // Attach the handlers BEFORE the Esc so the rejection is never unhandled
+    // (the real kernel awaits this promise; a bare test promise would crash).
+    const pending = kernel3
+      .askQuestion({
+        questions: [
+          {
+            id: 'plan-review',
+            question: 'Approve this plan and leave plan mode?',
+            detail: '# 计划二',
+            options: [{ label: 'Approve' }, { label: 'Keep planning' }],
+            intent: { kind: 'plan-review', approve: 'Approve' },
+          },
+        ],
+      })
+      .then(
+        () => {
+          rejected = '(resolved)'
+        },
+        (error: unknown) => {
+          rejected = error instanceof Error ? error.message : String(error)
+        },
+      )
+    await sleep(150)
+    stdin3.key('escape')
+    await sleep(120)
+    await pending
+    if (!rejected.includes('dismissed the plan review')) {
+      problems.push(`phase3：评审 Esc 未按“插话”语义拒绝：${rejected}`)
+    }
+  }
   await typeLine('/compact 留重点')
   await sleep(120)
   if (kernel3.record.compactLine !== '/compact 留重点') problems.push(`phase3：/compact 未经 commands.execute：${kernel3.record.compactLine}`)
@@ -1466,6 +1688,16 @@ async function main(): Promise<void> {
   const stdin4 = new FakeStdin()
   const kernel4 = new FakeKernel(true)
   kernel4.hideSessionQuery = true // registered "later" — eager capture would miss it forever
+  // A user-authored command tree for the menu: `ORCA_COMMANDS_DIR` replaces
+  // the project root so the harness never writes a `.orca/` into the repo.
+  const commandsRoot = mkdtempSync(join(tmpdir(), 'orca-dev-cmd-'))
+  writeFileSync(
+    join(commandsRoot, 'review.md'),
+    '---\ndescription: 审阅改动\nargument-hint: <path>\n---\n请审阅 $ARGUMENTS 的改动并给出结论',
+  )
+  mkdirSync(join(commandsRoot, 'db'), { recursive: true })
+  writeFileSync(join(commandsRoot, 'db', 'migrate.md'), '跑数据库迁移')
+  process.env['ORCA_COMMANDS_DIR'] = commandsRoot
   const dispose4 = bootstrapApp(
     kernel4,
     { provider: '', model: '', fullscreen: false },
@@ -1493,6 +1725,7 @@ async function main(): Promise<void> {
   await sleep(120)
   {
     const snap = paintScreen(writes4, 24)
+    writeFileSync(probePath('dev-phase4-menu.txt'), snap.map((r, i) => `${String(i).padStart(3)}| ${r}`).join('\n'))
     if (!snap.some((row) => row.includes('/resume'))) problems.push('phase4：/ 菜单未列出 /resume')
     if (!snap.some((row) => row.includes('/help'))) problems.push('phase4：/ 菜单未列出 /help')
   }
@@ -1536,7 +1769,7 @@ async function main(): Promise<void> {
   await sleep(80)
   // `commands/change` must refresh the discovered list live.
   kernel4.extraCommands = [
-    { name: 'goal', description: '目标模式' },
+    { name: 'goal', description: '目标模式', input: { hint: '<目标>' } },
     { name: 'schedule', description: '定时任务' },
   ]
   kernel4.emitKernelEvent('commands/change')
@@ -1547,9 +1780,120 @@ async function main(): Promise<void> {
     problems.push('phase4：commands/change 未刷新菜单')
   }
   stdin4.key('escape')
+  await sleep(120)
+  // ── Sections, fuzzy match, kernel input hints ──────────────────────────
+  stdin4.text('/')
+  await sleep(200)
+  if (!paintScreen(writes4, 24).some((row) => row.includes('本地'))) {
+    problems.push('phase4：菜单缺少「本地」分区')
+  }
+  stdin4.key('escape')
+  await sleep(80)
+  // Filtering to a user command / a skill must surface THEIR heading (the
+  // window only holds a handful of rows, so each query is checked on its own).
+  for (const ch of '/review') stdin4.text(ch)
+  await sleep(160)
+  {
+    const snap = paintScreen(writes4, 24)
+    if (!snap.some((row) => row.includes('自定义'))) problems.push('phase4：菜单缺少「自定义」分区')
+    if (!snap.some((row) => row.includes('/review <path>'))) problems.push('phase4：自定义命令未带 argument-hint')
+  }
+  stdin4.key('escape')
+  await sleep(80)
+  // A subsequence query finds the command even when no prefix matches.
+  for (const ch of '/modl') stdin4.text(ch)
+  await sleep(140)
+  // The POINTER row is what proves the fuzzy hit: the footer route text also
+  // contains a model name, so a bare `/model` needle could match it instead.
+  if (!paintScreen(writes4, 24).some((row) => row.includes('❯ /model'))) {
+    problems.push('phase4：子序列模糊匹配未命中 /model')
+  }
+  stdin4.key('escape')
+  await sleep(80)
+  // The kernel advertises an input hint; the menu shows it as usage copy.
+  for (const ch of '/go') stdin4.text(ch)
+  await sleep(140)
+  if (!paintScreen(writes4, 24).some((row) => row.includes('/goal <目标>'))) {
+    problems.push('phase4：内核命令的 input hint 未显示')
+  }
+  // A FULLY typed kernel command must DISPATCH on this Enter (the old
+  // completeMenu re-completed the same text forever, so it could never run).
+  stdin4.key('return') // completes to `/goal`
+  await sleep(120)
+  stdin4.key('return') // second Enter dispatches the completed line
+  await sleep(220)
+  if (!kernel4.record.commandLines.includes('/goal')) {
+    problems.push(`phase4：完整输入的内核命令未分发：${JSON.stringify(kernel4.record.commandLines)}`)
+  }
+  // ── User-authored commands: menu entry + $ARGUMENTS expansion ──────────
+  for (const ch of '/review src/app.ts') stdin4.text(ch)
+  await sleep(120)
+  stdin4.key('return')
+  await sleep(200)
+  {
+    const block = kernel4.record.followupMessage?.content[0]
+    const text = block?.type === 'text' ? block.text : ''
+    if (text !== '请审阅 src/app.ts 的改动并给出结论') {
+      problems.push(`phase4：自定义命令未按模板展开：${JSON.stringify(text)}`)
+    }
+  }
+  if (!visible4().includes('已展开自定义命令 /review')) problems.push('phase4：自定义命令未提示展开来源')
+  // Namespaced file (db/migrate.md → /db:migrate) is addressable too.
+  for (const ch of '/db:migrate') stdin4.text(ch)
+  await sleep(120)
+  stdin4.key('return')
+  await sleep(200)
+  {
+    const block = kernel4.record.followupMessage?.content[0]
+    const text = block?.type === 'text' ? block.text : ''
+    if (text !== '跑数据库迁移') problems.push(`phase4：命名空间命令未展开：${JSON.stringify(text)}`)
+  }
+  // ── Skills: only user-invocable ones are offered; invoking is a message ──
+  for (const ch of '/fake-skill') stdin4.text(ch)
+  await sleep(200)
+  {
+    const snap = paintScreen(writes4, 24).join('\n')
+    if (!snap.includes('/fake-skill-a')) problems.push('phase4：可调用 skill 未进菜单')
+    if (snap.includes('fake-skill-b')) problems.push('phase4：仅模型可用的 skill 不应出现在菜单')
+  }
+  stdin4.key('escape')
+  await sleep(80)
+  for (const ch of '/fake-skill-a') stdin4.text(ch)
+  await sleep(120)
+  stdin4.key('return')
+  await sleep(200)
+  {
+    const block = kernel4.record.followupMessage?.content[0]
+    const text = block?.type === 'text' ? block.text : ''
+    if (text !== '/fake-skill-a') {
+      problems.push(`phase4：skill 调用未作为用户消息提交（内核手势需要原文）：${JSON.stringify(text)}`)
+    }
+  }
+  // `/skills` reports the human catalogue and counts model-only entries.
+  for (const ch of '/skills') stdin4.text(ch)
+  await sleep(120)
+  stdin4.key('return')
+  await sleep(250)
+  {
+    const out = visible4()
+    if (!out.includes('/fake-skill-a')) problems.push('phase4：/skills 未列出可调用 skill')
+    if (!out.includes('另 1 个仅供模型调用')) problems.push('phase4：/skills 未统计仅模型可用的 skill')
+  }
+  // Without the service the whole feature degrades silently (menu keeps the
+  // static commands, `/skills` explains what is missing).
+  kernel4.hideSkills = true
+  for (const ch of '/skills') stdin4.text(ch)
+  await sleep(120)
+  stdin4.key('return')
+  await sleep(200)
+  if (!visible4().includes('skills 服务未挂载')) problems.push('phase4：缺失 skills 服务应明确提示')
+  kernel4.hideSkills = false
+  stdin4.key('escape')
   await sleep(80)
   dispose4()
   await sleep(20)
+  delete process.env['ORCA_COMMANDS_DIR']
+  rmSync(commandsRoot, { recursive: true, force: true })
 
   // ── Phase 5: 同进程静默重挂载（热重载不再叠欢迎卡/建新会话）────────────────
   const writes5a: string[] = []
@@ -2251,7 +2595,8 @@ async function main(): Promise<void> {
     try {
       writeFileSync(probePath('dev-phase2-screen.txt'), rows2.map((r, i) => `${String(i).padStart(3)}| ${r}`).join('\n'))
       writeFileSync(probePath('dev-phase3-stream.txt'), stripSgr(writes3.join('')))
-      console.error(`失败屏面已写入 ${probePath('dev-phase2-screen.txt')} / dev-phase3-stream.txt`)
+      writeFileSync(probePath('dev-phase4-screen.txt'), paintScreen(writes4, 24).map((r, i) => `${String(i).padStart(3)}| ${r}`).join('\n'))
+      console.error(`失败屏面已写入 ${probePath('dev-phase2-screen.txt')} / dev-phase3-stream.txt / dev-phase4-screen.txt`)
     } catch {}
     process.exit(1)
   }

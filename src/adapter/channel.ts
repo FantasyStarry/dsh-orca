@@ -329,8 +329,19 @@ export class Channel {
   private turnCacheWrite = 0
   /** Latest folded `session/title` text — session truth for footer/browser. */
   title: string | null = null
-  /** Latest todo list from `todo/write` (agent truth; UI edits are local). */
+  /**
+   * Latest todo list from `todo/write` — the MODEL's whole-list state. The UI
+   * only ever displays it: human edits go back as an instruction (the kernel
+   * invariant rejects a durable `todo/write` outside an open turn), so there
+   * is no local mutation path to keep in sync.
+   */
   todos: TodoItem[] = []
+  /**
+   * Kernel plan-mode state, folded from the log-only `plan/mode` event the
+   * way `dsh-plan-mode`'s own `plan` projection does. The UI never keeps a
+   * local plan flag: resume/fork/compaction must recover it from the log.
+   */
+  planActive = false
   /** True while a `compaction/start` … `compaction/end` cycle is open. */
   compacting = false
   /** Last observed event seq (for rewind boundaries). Null before any event. */
@@ -724,6 +735,12 @@ export class Channel {
         this.pushSystem(`审批结果${tool === undefined ? '' : `（${tool}）`}：${label}`)
         break
       }
+      case 'plan/mode': {
+        const data = dataOf(event)
+        this.planActive = data['active'] === true
+        this.version++
+        break
+      }
       case 'todo/write': {
         const data = dataOf(event)
         const todos = Array.isArray(data['todos']) ? data['todos'] : []
@@ -857,6 +874,7 @@ export class Channel {
     this.turnCacheWrite = 0
     this.title = null
     this.todos = []
+    this.planActive = false
     this.compacting = false
     this.lastSeq = null
     this.turnSeqs = []

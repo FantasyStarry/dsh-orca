@@ -26,7 +26,8 @@
 - `pnpm build`（tsc → `lib/`）必须零错误；strict + `noUncheckedIndexedAccess` + `exactOptionalPropertyTypes` 已开，新代码不得用 `any` 逃逸（防御性解析用 `unknown` + 收窄）。
 - 内核接缝类型是**镜像**（`src/kernel/types.ts`）：与真实 `@deepseek-ai/*` 面不一致时改镜像并注明核对过的内核版本；镜像上必须有 doc 注明对应接缝。
 - 未知事件类型/字段一律宽容忽略（内核是 developer preview，破坏性变更是预期）。
-- 文案中文优先；宽度计算永远按 terminal cell，不按 `string.length`。
+- **不留影子实现**：内核已有真源的能力（`/plan` 的 `plan/mode`、`/todo` 的 `todo/write`、`/permission` 的档位、`/compact`…）不得在 UI 侧另做一份本地状态；本地同名命令只能**委托**内核命令（`ctx.commands.execute`）并把内核状态投影进 UI。这一条来自 2026-09 的对标盘点：三处影子实现曾各自偏离内核语义（见 `docs/planning/parity-gap-claude-code-kimi-code.md` §3.3）。
+- 文案中文优先；宽度计算永远按 terminal cell，不按 `string.length`。**`/help` 这类逐行渲染的文案要保持单行长度可控**：一行被宽度截断会把整块的重画拆成多次写入，字节流断言会因此看不到连续的字符串（`scripts/dev.ts` 有注释说明）。
 - 提交信息：**Conventional Commits**（`feat:` / `fix:` / `refactor:` / `docs:` / `chore:`），主题行中文写清做了什么——新增了什么、修复了什么、删除了什么；可附英文摘要。（2026-08 起，历史提交不改写。）
 
 ## 验证（提交前必跑）
@@ -37,7 +38,7 @@ pnpm dev   # 假内核冒烟：TTY 渲染循环、键盘、多行编辑、鼠标
 pnpm test  # 生命周期 + 渲染回归 + 事件投影 + 选区几何/剪贴板
 ```
 
-改了内核接缝的投影就补 `scripts/channel.test.ts`，改了编辑器/选区几何就补 `scripts/render-regressions.ts` / `scripts/selection.test.ts`——**新增断言要做变异验证**（先把实现改坏，确认断言真的会红，再改回来）。
+改了内核接缝的投影就补 `scripts/channel.test.ts`，改了编辑器/选区几何就补 `scripts/render-regressions.ts` / `scripts/selection.test.ts`，改了自定义命令的解析/扫描就补 `scripts/commands.test.ts`——**新增断言要做变异验证**（先把实现改坏，确认断言真的会红，再改回来）。
 
 涉及真实内核的改动，需在 profile 内实测：`dsh plugin --profile orca add .` → `dsh --profile orca`；能自动化的一律写进 `scripts/probe-pty.mjs`（真 ConPTY 驱动，`--state` 零 API 调用；`--features` / `--live` 各花一次最小调用），会话日志用 `scripts/inspect-session.mjs <session-id>` 取证。
 
@@ -57,6 +58,7 @@ pnpm test  # 生命周期 + 渲染回归 + 事件投影 + 选区几何/剪贴板
 | `src/tui/selection.ts` | 备用屏鼠标选区：纯函数（**cell 列**映射 + SGR 感知的走字），`paintSelection` 只插入反显、不改宽度，`selectionText` 抠出纯文本交给 OSC 52 |
 | `src/tui/keys.ts` | vendored 键盘解码（kimi-code/pi-tui：Kitty 协议 + legacy CSI/SS3）；除两处 `exactOptionalPropertyTypes` 适配外与上游逐字一致，改动要保住可 diff |
 | `src/tui/width.ts` | 显示宽度（`get-east-asian-width`；`…`/`⋯` 额外按 2 cell 计，要精确占满宽度的行必须先过 `asciiEllipses`） |
+| `src/custom-commands.ts` | 自定义命令（Markdown 提示词模板）的解析与扫描：frontmatter 子集、`db/migrate.md` → `/db:migrate` 命名空间、项目根优先、64KiB/256 条上限、`$ARGUMENTS` 展开；纯函数，单测在 `scripts/commands.test.ts` |
 | `src/kernel/types.ts` | 内核接缝类型镜像（唯一允许"像内核"的地方） |
 | `cordis.patch.yml` | Orca bundle patch：除自身行外还插入内核 `workspace` 行（`@deepseek-ai/dsh-workspace`，dsh-base 不含）与预设 roster |
 | `scripts/dev.ts` | 假内核冒烟 harness |
@@ -66,4 +68,5 @@ pnpm test  # 生命周期 + 渲染回归 + 事件投影 + 选区几何/剪贴板
 | `scripts/inspect-session.mjs` | 会话日志取证 CLI（落盘的模型记录 / 附件 / 事件词表） |
 | `bin/orca.js` | 启动器：`orca` ≡ `dsh --profile orca` |
 | `docs/research/` | 三份上游调研报告（动手借鉴前必读对应篇） |
+| `docs/planning/parity-gap-claude-code-kimi-code.md` | 对标 Claude Code / Kimi Code 的差距矩阵 + 优先级路线图 + 证据复现命令（做"对标功能"前先读它，并回填"Orca 现状"列） |
 | `docs/adr/` | 架构决策记录 |

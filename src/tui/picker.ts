@@ -27,6 +27,13 @@ export interface PickerItem {
   readonly hint?: string
   /** Non-selectable row (e.g. the loading placeholder) — confirm() skips it. */
   readonly disabled?: boolean
+  /**
+   * Optional grouping header. A header row is emitted whenever the section
+   * changes between adjacent items (so callers list items grouped by
+   * section). Headers occupy window slots like items: the panel keeps its
+   * fixed height and never moves the transcript around it.
+   */
+  readonly section?: string
 }
 
 export interface PickerState {
@@ -92,17 +99,38 @@ export function renderPicker(state: PickerState, width: number, maxItems = 17): 
   // window clamps to the caller viewport budget — it only shrinks on very
   // short terminals.
   const itemWindow = Math.max(3, Math.min(9, Math.floor(maxItems)))
-  const itemLimit = state.items.length <= itemWindow ? state.items.length : Math.max(1, itemWindow - 2)
-  const before = Math.floor((itemLimit - 1) / 2)
-  const from = Math.max(0, Math.min(Math.max(0, state.items.length - itemLimit), state.index - before))
-  const visible = state.items.slice(from, from + itemLimit)
+  // Rows = section headers + items, windowed TOGETHER so a header can never
+  // be cut off from its first item by the scroll window.
+  type Row = { readonly kind: 'header'; readonly label: string } | { readonly kind: 'item'; readonly index: number }
+  const rows: Row[] = []
+  let lastSection: string | undefined
+  for (let index = 0; index < state.items.length; index++) {
+    const item = state.items[index]
+    if (!item) continue
+    if (item.section !== undefined && item.section !== lastSection) {
+      rows.push({ kind: 'header', label: item.section })
+      lastSection = item.section
+    }
+    rows.push({ kind: 'item', index })
+  }
+  const selectedRow = Math.max(0, rows.findIndex((row) => row.kind === 'item' && row.index === state.index))
+  const rowLimit = rows.length <= itemWindow ? rows.length : Math.max(1, itemWindow - 2)
+  const before = Math.floor((rowLimit - 1) / 2)
+  const from = Math.max(0, Math.min(Math.max(0, rows.length - rowLimit), selectedRow - before))
+  const visible = rows.slice(from, from + rowLimit)
   const area: string[] = []
   const above = from
   if (above > 0) area.push(theme.subtle(` ▲ ${above} more`))
   for (let i = 0; i < visible.length; i++) {
-    const item = visible[i]
+    const row = visible[i]
+    if (!row) continue
+    if (row.kind === 'header') {
+      area.push(theme.subtle(` ${cleanLine(row.label)}`))
+      continue
+    }
+    const item = state.items[row.index]
     if (!item) continue
-    const actual = from + i
+    const actual = row.index
     const selected = actual === state.index
     const pointer = selected ? theme.title('❯ ') : ' '.repeat(POINTER_W)
     const cleanLabel = cleanLine(item.label)
@@ -123,7 +151,7 @@ export function renderPicker(state: PickerState, width: number, maxItems = 17): 
       area.push(cut)
     }
   }
-  const remaining = state.items.length - (from + visible.length)
+  const remaining = rows.length - (from + visible.length)
   if (remaining > 0) {
     area.push(theme.subtle(` ▼ ${remaining} more`))
   }
