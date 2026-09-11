@@ -95,6 +95,14 @@ let rowId = 0
 /** Max characters of raw tool arguments kept as the tool-row preview. */
 const ARGS_PREVIEW_MAX = 160
 
+/**
+ * Cap on raw arguments retained for approval matching / panel expansion. A
+ * tool call larger than this (a whole file body, say) keeps only the preview:
+ * a rule for it is then matched on the tool name alone, which the panel and
+ * `/perms` both show.
+ */
+const MAX_RETAINED_ARGS = 64 * 1024
+
 function recordOf(value: unknown): Record<string, unknown> | undefined {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -352,6 +360,13 @@ export class Channel {
   private openAssistantId: number | null = null
   private openThoughtId: number | null = null
   private readonly pendingTools = new Map<string, TranscriptRow>()
+  /**
+   * Raw `tool/call` arguments per pending call id, kept ONLY while the call is
+   * running. The approval rule layer matches on them (`/perms`), and the
+   * approval panel expands them on demand; a call that never asks still costs
+   * nothing beyond the running window.
+   */
+  private readonly pendingArgs = new Map<string, string>()
   /** Audit pairing: `approval/asked` id → the tool it is about. */
   private readonly approvalTools = new Map<string, string>()
   /** Route printed by the previous turn summary — repeats are omitted. */
@@ -592,7 +607,11 @@ export class Channel {
           ...(callId ? { toolCallId: callId } : {}),
         }
         this.rows.push(row)
-        if (callId) this.pendingTools.set(callId, row)
+        if (callId) {
+          this.pendingTools.set(callId, row)
+          const raw = str(data, 'arguments', 'input')
+          if (raw !== '' && raw.length <= MAX_RETAINED_ARGS) this.pendingArgs.set(callId, raw)
+        }
         this.runState = 'working'
         break
       }
@@ -614,6 +633,7 @@ export class Channel {
           last.status = failed ? 'failed' : 'ok'
           last.seq = ++this.version
           if (last.toolCallId) this.pendingTools.delete(last.toolCallId)
+          if (last.toolCallId) this.pendingArgs.delete(last.toolCallId)
           const diff = diffViewFromMeta(data['meta'])
           if (diff) {
             last.diff = diff
@@ -862,6 +882,7 @@ export class Channel {
     this.openAssistantId = null
     this.openThoughtId = null
     this.pendingTools.clear()
+    this.pendingArgs.clear()
     this.approvalTools.clear()
     this.runState = 'idle'
     this.route = null
@@ -895,6 +916,15 @@ export class Channel {
   toolPreviewFor(callId: string): string | undefined {
     const row = this.pendingTools.get(callId)
     return row !== undefined && row.text !== '' ? row.text : undefined
+  }
+
+  /**
+   * The full raw arguments of a still-running tool call. Used by the approval
+   * rule layer (matching) and the panel's Ctrl-E expansion; undefined once the
+   * call settled or when the payload exceeded `MAX_RETAINED_ARGS`.
+   */
+  toolArgumentsFor(callId: string): string | undefined {
+    return this.pendingArgs.get(callId)
   }
 
   /** Stamp the sealed duration onto the open thought row and close it. */

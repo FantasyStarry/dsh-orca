@@ -17,7 +17,7 @@
  */
 
 import { EventEmitter } from 'node:events'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { bootstrapApp } from '../src/app.js'
@@ -42,6 +42,19 @@ import type {
 } from '../src/kernel/types.js'
 
 const sleep = (ms: number): Promise<void> => new Promise<void>((resolve) => setTimeout(resolve, ms))
+
+/**
+ * Boot config for the harness. Every phase starts from the same defaults — the
+ * app reads `autoAllowReadOnly` defensively, but a call site that omits a key
+ * would silently stop exercising the real path.
+ */
+const cfg = (over: Partial<OrcaConfig> = {}): OrcaConfig => ({
+  provider: '',
+  model: '',
+  fullscreen: false,
+  autoAllowReadOnly: true,
+  ...over,
+})
 
 /**
  * The durable log a resumed session replays: the real kernel loads the stored
@@ -1202,7 +1215,7 @@ async function main(): Promise<void> {
   const kernel1 = new FakeKernel(false)
   const dispose1 = bootstrapApp(
     kernel1,
-    { provider: '', model: '', fullscreen: false },
+    cfg(),
     { stdout: () => makeStdout(writes1), stdin: () => new FakeStdin() },
   )
   await sleep(150)
@@ -1220,7 +1233,7 @@ async function main(): Promise<void> {
     kernel2,
     // Empty provider/model: the composition default (agentDefaultModel) must
     // be picked up — the exact path the real profile exercises.
-    { provider: '', model: '', fullscreen: false },
+    cfg(),
     { stdout: () => makeStdout(writes2), stdin: () => stdin2 },
   )
   await sleep(250) // create() retries once (factory pending), then connects
@@ -1368,7 +1381,7 @@ async function main(): Promise<void> {
   const kernel3 = new FakeKernel(true)
   const dispose3 = bootstrapApp(
     kernel3,
-    { provider: '', model: '', fullscreen: false },
+    cfg(),
     { stdout: () => makeStdout(writes3), stdin: () => stdin3 },
   )
   await sleep(250)
@@ -1700,7 +1713,7 @@ async function main(): Promise<void> {
   process.env['ORCA_COMMANDS_DIR'] = commandsRoot
   const dispose4 = bootstrapApp(
     kernel4,
-    { provider: '', model: '', fullscreen: false },
+    cfg(),
     { stdout: () => makeStdout(writes4), stdin: () => stdin4 },
   )
   await sleep(300)
@@ -1900,7 +1913,7 @@ async function main(): Promise<void> {
   const kernel5 = new FakeKernel(true)
   const dispose5a = bootstrapApp(
     kernel5,
-    { provider: '', model: '', fullscreen: false },
+    cfg(),
     { stdout: () => makeStdout(writes5a), stdin: () => new FakeStdin() },
   )
   await sleep(300)
@@ -1917,7 +1930,7 @@ async function main(): Promise<void> {
   const stdin5b = new FakeStdin()
   const dispose5b = bootstrapApp(
     kernel5,
-    { provider: '', model: '', fullscreen: false },
+    cfg(),
     { stdout: () => makeStdout(writes5b), stdin: () => stdin5b },
   )
   await sleep(300)
@@ -1938,7 +1951,7 @@ async function main(): Promise<void> {
     const kernel6 = new FakeKernel(true)
     const dispose6 = bootstrapApp(
       kernel6,
-      { provider: '', model: '', fullscreen: false },
+      cfg(),
       { stdout: () => makeStdout(rw), stdin: () => stdin6 },
     )
     await sleep(250)
@@ -1980,7 +1993,7 @@ async function main(): Promise<void> {
     const kernel7 = new FakeKernel(true)
     const dispose7 = bootstrapApp(
       kernel7,
-      { provider: '', model: '', fullscreen: true },
+      cfg({ fullscreen: true }),
       { stdout: () => makeStdout(rw, 24), stdin: () => stdin7 },
     )
     await sleep(250)
@@ -2044,7 +2057,7 @@ async function main(): Promise<void> {
     const kernel8 = new FakeKernel(true)
     const dispose8 = bootstrapApp(
       kernel8,
-      { provider: '', model: '', fullscreen: false },
+      cfg(),
       { stdout: () => makeStdout(rw), stdin: () => stdin8 },
     )
     await sleep(250)
@@ -2223,7 +2236,7 @@ async function main(): Promise<void> {
     const kernel9 = new FakeKernel(true)
     const dispose9 = bootstrapApp(
       kernel9,
-      { provider: 'cfg-p', model: 'cfg-m', fullscreen: false },
+      cfg({ provider: 'cfg-p', model: 'cfg-m' }),
       { stdout: () => makeStdout(rw), stdin: () => new FakeStdin() },
     )
     await sleep(250)
@@ -2250,7 +2263,7 @@ async function main(): Promise<void> {
     const kernel10 = new FakeKernel(true)
     const dispose10 = bootstrapApp(
       kernel10,
-      { provider: '', model: '', fullscreen: false },
+      cfg(),
       { stdout: () => makeStdout(writes10), stdin: () => stdin10 },
     )
     await sleep(300) // boot create (factory-race retry) + default mount
@@ -2293,7 +2306,7 @@ async function main(): Promise<void> {
     kernel11.presetMountFails = true
     const dispose11 = bootstrapApp(
       kernel11,
-      { provider: '', model: '', fullscreen: false },
+      cfg(),
       { stdout: () => makeStdout(writes11), stdin: () => new FakeStdin() },
     )
     await sleep(900) // 100ms factory race + mount rejection + rosterless retry
@@ -2327,7 +2340,7 @@ async function main(): Promise<void> {
     kernel12.writeWorkspaceMedium()
     const dispose12 = bootstrapApp(
       kernel12,
-      { provider: '', model: '', fullscreen: false },
+      cfg(),
       { stdout: () => makeStdout(writes12), stdin: () => stdin12 },
     )
     await sleep(300)
@@ -2350,7 +2363,7 @@ async function main(): Promise<void> {
     const writes12b: string[] = []
     const dispose12b = bootstrapApp(
       kernel12,
-      { provider: '', model: '', fullscreen: false },
+      cfg(),
       { stdout: () => makeStdout(writes12b), stdin: () => new FakeStdin() },
     )
     await sleep(300)
@@ -2375,7 +2388,7 @@ async function main(): Promise<void> {
       const writes: string[] = []
       const dispose = bootstrapApp(
         kernel,
-        { provider: '', model: '', fullscreen: false },
+        cfg(),
         { stdout: () => makeStdout(writes), stdin: () => new FakeStdin() },
       )
       await sleep(300)
@@ -2428,7 +2441,7 @@ async function main(): Promise<void> {
     const kernel13 = new FakeKernel(true)
     const dispose13 = bootstrapApp(
       kernel13,
-      { provider: '', model: '', fullscreen: false },
+      cfg(),
       { stdout: () => makeStdout(writes13), stdin: () => stdin13 },
     )
     await sleep(300)
@@ -2489,7 +2502,7 @@ async function main(): Promise<void> {
       const kernel = new FakeKernel(true)
       const disposeA = bootstrapApp(
         kernel,
-        { provider: '', model: '', fullscreen: false },
+        cfg(),
         { stdout: () => makeStdout([]), stdin: () => new FakeStdin() },
       )
       await sleep(250)
@@ -2499,7 +2512,7 @@ async function main(): Promise<void> {
       const writes: string[] = []
       const disposeB = bootstrapApp(
         kernel,
-        { provider: '', model: '', fullscreen: false },
+        cfg(),
         { stdout: () => makeStdout(writes), stdin: () => new FakeStdin() },
       )
       await sleep(300)
@@ -2555,7 +2568,7 @@ async function main(): Promise<void> {
       kernel14.persistedSessions.add('session-aaa') // the session the picker lists
       const dispose14 = bootstrapApp(
         kernel14,
-        { provider: '', model: '', fullscreen: false },
+        cfg(),
         { stdout: () => makeStdout(writes14), stdin: () => stdin14 },
       )
       await sleep(300)
@@ -2588,6 +2601,166 @@ async function main(): Promise<void> {
       dispose14()
       await sleep(20)
     }
+  }
+
+
+  // ── Phase 13: 审批规则层（/perms）────────────────────────────────────────────
+  // The kernel owns the ASK but has no rules, so this layer decides which asks
+  // reach the panel. What must hold: a matching allow/deny never shows a panel,
+  // a miss still asks, panel-captured rules really persist, and the read-only
+  // builtin set is a switch rather than a hole (an explicit deny still wins).
+  //
+  // NOTE on assertions: the transcript is asserted through the painted byte
+  // stream, and a block taller than the live window never paints its head — so
+  // the rule listing is deliberately kept SHORT (the builtin block is switched
+  // off first) instead of checking for the 12th row of a long list.
+  {
+    const writes15: string[] = []
+    const stdin15 = new FakeStdin()
+    const kernel15 = new FakeKernel(true)
+    const rulesRoot = mkdtempSync(join(tmpdir(), 'orca-dev-perms-'))
+    const projectRules = join(rulesRoot, 'project.json')
+    const userRules = join(rulesRoot, 'user.json')
+    writeFileSync(
+      projectRules,
+      JSON.stringify({
+        rules: [
+          { decision: 'allow', pattern: 'bash(npm test:*)', reason: '常用测试' },
+          { decision: 'deny', pattern: 'bash(rm -rf:*)' },
+        ],
+      }),
+    )
+    process.env['ORCA_PERMISSIONS_FILE'] = projectRules
+    // The user file must ALSO be redirected: leaving it unset would read (and,
+    // on capture, write) the real ~/.dsh/orca/permissions.json.
+    process.env['ORCA_PERMISSIONS_USER_FILE'] = userRules
+    const dispose15 = bootstrapApp(kernel15, cfg(), { stdout: () => makeStdout(writes15), stdin: () => stdin15 })
+    await sleep(300)
+    const visible15 = (): string => stripSgr(writes15.join(''))
+    const run15 = (line: string): Promise<void> => {
+      for (const ch of line) stdin15.text(ch)
+      stdin15.key('return')
+      return sleep(250)
+    }
+    const ask = async (tool: string, callId: string, args: string): Promise<string> => {
+      kernel15.emit('tool/call', { turn: 1, step: 1, callId, name: tool, arguments: args })
+      await sleep(60)
+      const listener = kernel15.record.approvalListener
+      if (!listener) throw new Error('phase13：approval waterfall 未注册')
+      return (await listener({ toolName: tool, callId, reason: '规则层单测' }, async () => 'unavailable')) as string
+    }
+    /**
+     * Every approval wait is BOUNDED. A rule hit answers inline, but a miss goes
+     * to the PANEL and the ask only settles when someone answers that panel — so
+     * a regression that shows the wrong panel (or no panel at all) parks this
+     * harness forever instead of failing it. A hang here is worse than a
+     * failure: it also strands whoever is driving us (the mutation check gets
+     * killed mid-run and the tree stays mutated). `未结算` is deliberately not a
+     * valid outcome, so the owning assertion goes red instead.
+     */
+    const settle = async (asked: Promise<string>, ms = 2000): Promise<string> => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const bound = new Promise<string>((resolve) => {
+        timer = setTimeout(() => resolve('未结算'), ms)
+      })
+      try {
+        return await Promise.race([asked, bound])
+      } finally {
+        if (timer !== undefined) clearTimeout(timer)
+      }
+    }
+
+    // (a) A matching allow rule answers without a panel, and says so out loud.
+    const allowed = await settle(ask('bash', 'call-rule-allow', '{"command":"npm test -- --watch"}'))
+    await sleep(150)
+    if (allowed !== 'allowed-once') problems.push(`phase13：规则 allow 未自动放行：${allowed}`)
+    if (!visible15().includes('⛨ 规则命中')) problems.push('phase13：规则放行未在转录里说明')
+    if (!visible15().includes('bash(npm test:*)')) problems.push('phase13：规则放行未写明命中的模式')
+    if (visible15().includes('审批：bash')) problems.push('phase13：命中规则时不应弹面板')
+
+    // (b) A matching deny answers `rejected` — the tool never runs.
+    const denied = await settle(ask('bash', 'call-rule-deny', '{"command":"rm -rf /"}'))
+    await sleep(150)
+    if (denied !== 'rejected') problems.push(`phase13：规则 deny 未自动拒绝：${denied}`)
+    if (!visible15().includes('deny bash(rm -rf:*)')) problems.push('phase13：deny 命中未回执')
+
+    // (c) A miss still asks; `1` allows once (panel order: 1 单次 / 2 会话 / 3 总是 / 4 拒绝).
+    const missed = ask('bash', 'call-rule-miss', '{"command":"npm ci"}')
+    await sleep(200)
+    if (!visible15().includes('审批：bash')) problems.push('phase13：未命中规则时仍应弹面板')
+    if (!visible15().includes('总是放行 bash(npm ci:*)')) problems.push('phase13：面板未给出可复核的窄规则')
+    stdin15.text('1')
+    if ((await settle(missed)) !== 'allowed-once') problems.push('phase13：面板放行单次失效')
+
+    // (d) Panel-captured session rule: `2` writes one, and the very next
+    // identical ask is auto-allowed with no panel at all.
+    const captured = ask('bash', 'call-rule-session', '{"command":"npm run build"}')
+    await sleep(200)
+    if (!visible15().includes('本会话放行 bash')) problems.push('phase13：面板缺少「本会话放行」选项')
+    stdin15.text('2')
+    if ((await settle(captured)) !== 'allowed-once') problems.push('phase13：会话放行未放行当前调用')
+    await sleep(150)
+    if (!visible15().includes('已加规则：allow bash')) problems.push('phase13：会话规则未回执')
+    const second = await settle(ask('bash', 'call-rule-session-2', '{"command":"npm run build"}'))
+    await sleep(150)
+    if (second !== 'allowed-once') problems.push(`phase13：会话规则未生效：${second}`)
+
+    // (e) Ctrl-E dumps the FULL arguments (a one-line preview is not enough to
+    // approve a file write), and Esc still rejects.
+    const expandable = ask('write', 'call-rule-expand', '{"path":"src/app.ts","content":"第一行\\n第二行"}')
+    await sleep(200)
+    stdin15.key('e', { ctrl: true })
+    await sleep(200)
+    if (!visible15().includes('"content": "第一行\\n第二行"')) problems.push('phase13：Ctrl-E 未展开完整参数')
+    stdin15.key('escape')
+    if ((await settle(expandable)) !== 'rejected') problems.push('phase13：面板 Esc 未拒绝')
+
+    // (f) The read-only builtin block is a real switch…
+    const readAllowed = await settle(ask('read', 'call-read-on', '{"path":"README.md"}'))
+    await sleep(150)
+    if (readAllowed !== 'allowed-once') problems.push(`phase13：只读免问未生效：${readAllowed}`)
+    await run15('/perms reads off')
+    if (!visible15().includes('只读工具免问已关闭')) problems.push('phase13：/perms reads off 未回执')
+    // …and with it off the listing is short enough to assert head-to-tail, which
+    // also proves the 8 builtin rows are really gone from the stack.
+    await run15('/perms')
+    const listed = visible15()
+    if (!listed.includes('审批规则（共 3 条）')) problems.push('phase13：/perms 未按开关统计规则（关掉内置后应为 3 条）')
+    if (!listed.includes('deny > ask > allow')) problems.push('phase13：/perms 未说明判定优先级')
+    if (!listed.includes('bash(npm test:*)')) problems.push('phase13：/perms 未列项目规则')
+    if (!listed.includes('[本会话]')) problems.push('phase13：/perms 未列出会话规则来源')
+    if (!listed.includes(projectRules)) problems.push('phase13：/perms 未写明规则文件路径')
+
+    // (g) With the builtin block off, a read ask really reaches the panel.
+    const readAsked = ask('read', 'call-read-off', '{"path":"README.md"}')
+    await sleep(200)
+    if (!visible15().includes('审批：read')) problems.push('phase13：关掉免问后只读工具仍应确认')
+    stdin15.text('4')
+    if ((await settle(readAsked)) !== 'rejected') problems.push('phase13：编号 4 未拒绝')
+
+    // (h) A new project rule lands in the FILE (reviewable, committable) and
+    // `rm` removes it again. Numbering with the builtin block off: 1..2 are the
+    // file's rules, 3 is the one just added, 4 the session rule.
+    await run15('/perms allow write(src/**) --reason 改源码')
+    const afterAdd = JSON.parse(readFileSync(projectRules, 'utf8')) as { rules: { pattern: string; reason?: string }[] }
+    const added = afterAdd.rules.find((entry) => entry.pattern === 'write(src/**)')
+    if (!added) problems.push(`phase13：/perms allow 未写入项目规则文件：${JSON.stringify(afterAdd.rules)}`)
+    else if (added.reason !== '改源码') problems.push(`phase13：--reason 未写入：${JSON.stringify(added)}`)
+    await run15('/perms rm 3')
+    const afterRemove = JSON.parse(readFileSync(projectRules, 'utf8')) as { rules: { pattern: string }[] }
+    if (afterRemove.rules.some((entry) => entry.pattern === 'write(src/**)')) problems.push('phase13：/perms rm 未删除规则')
+
+    // (i) A broken file is reported instead of being silently ignored.
+    writeFileSync(projectRules, '{ 坏掉的')
+    await run15('/perms reload')
+    if (!visible15().includes('规则文件无法解析')) problems.push('phase13：损坏的规则文件未报告')
+
+    writeFileSync(probePath('dev-phase13-stream.txt'), visible15())
+    dispose15()
+    await sleep(20)
+    delete process.env['ORCA_PERMISSIONS_FILE']
+    delete process.env['ORCA_PERMISSIONS_USER_FILE']
+    rmSync(rulesRoot, { recursive: true, force: true })
   }
 
   if (problems.length > 0) {

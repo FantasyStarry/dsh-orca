@@ -28,12 +28,20 @@ export interface OrcaConfig {
   model: string
   /** Alternate-screen fullscreen (target experience) vs inline main screen. */
   fullscreen: boolean
+  /**
+   * Auto-approve read-only tools (`read` / `glob` / `grep` / …) instead of
+   * asking per call. Deny and ask rules always win over these builtin allows,
+   * so this is a noise switch, never a hole: `/perms reads off` turns it off
+   * for one run.
+   */
+  autoAllowReadOnly: boolean
 }
 
 const DEFAULTS: OrcaConfig = {
   provider: '',
   model: '',
   fullscreen: false,
+  autoAllowReadOnly: true,
 }
 
 /** Minimal Standard Schema v1 types (https://standardschema.dev). */
@@ -60,7 +68,9 @@ function validateConfig(value: unknown): StandardResult {
   const provider = typeof raw['provider'] === 'string' ? raw['provider'] : DEFAULTS.provider
   const model = typeof raw['model'] === 'string' ? raw['model'] : DEFAULTS.model
   const fullscreen = typeof raw['fullscreen'] === 'boolean' ? raw['fullscreen'] : DEFAULTS.fullscreen
-  return { value: { provider, model, fullscreen } satisfies OrcaConfig }
+  const autoAllowReadOnly =
+    typeof raw['autoAllowReadOnly'] === 'boolean' ? raw['autoAllowReadOnly'] : DEFAULTS.autoAllowReadOnly
+  return { value: { provider, model, fullscreen, autoAllowReadOnly } satisfies OrcaConfig }
 }
 
 export const Config: StandardSchema = {

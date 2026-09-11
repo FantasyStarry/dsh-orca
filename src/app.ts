@@ -32,6 +32,17 @@ import type { CustomCommand } from './custom-commands.js'
 import { Channel, isStreamChunk } from './adapter/channel.js'
 import type { SessionRoute } from './adapter/channel.js'
 import type { OrcaConfig } from './index.js'
+import {
+  builtinRules,
+  evaluateCall,
+  parseRulePattern,
+  readRulesFile,
+  ruleText,
+  rulesPaths,
+  suggestPattern,
+  writeRulesFile,
+} from './permission-rules.js'
+import type { PermissionRule, RuleDecision, RuleScope } from './permission-rules.js'
 import type {
   Agent,
   AgentHandle,
@@ -152,6 +163,7 @@ const SLASH_COMMANDS: readonly SlashCommand[] = [
   { name: 'usage', aliases: [], group: '信息', description: '显示 token 用量明细' },
   { name: 'yolo', aliases: [], group: '模式', description: '审批全放行开关（on/off）' },
   { name: 'permission', aliases: [], group: '模式', description: '查看/切换权限档位（内核预设）' },
+  { name: 'perms', aliases: ['rules'], group: '模式', description: '本地审批规则（allow/deny/ask、只读免问、会话放行）' },
   { name: 'nerdfont', aliases: ['branch-icon'], group: '界面', description: '切换页脚 git 分支 Nerd Font 图标（on/off，无参切换）' },
   { name: 'skills', aliases: [], group: '扩展', description: '列出可用 skill（输入 /名字 直接调用）' },
   { name: 'update', aliases: ['upgrade'], group: '信息', description: '检查并更新 dsh-orca 到最新版' },
@@ -382,11 +394,72 @@ export function bootstrapApp(
     /** Exact tool call being decided, when the asker had one. */
     readonly callId?: string
     readonly reason: string
+    /** Rule that already decided this ask (`ask` rules only reach the panel). */
+    readonly rule?: PermissionRule
     resolve: (outcome: 'allowed-once' | 'rejected' | 'cancelled') => void
     settled: boolean
   }
 
   const approvalQueue: PendingApproval[] = []
+
+  // ── approval rule layer (/perms) ──────────────────────────────────────────
+  // The kernel has no rules (only `ask` | `never`), so "don't ask me again"
+  // lives here. Rules answer the ask; they never run a tool the kernel
+  // refused, and nothing local ever decides a call the kernel never asked
+  // about. `answerApproval` below is the single gate.
+
+  /** Session-scoped rules: created by the panel, gone with the session. */
+  let sessionRules: PermissionRule[] = []
+  /** File-backed rules, re-read on demand (`/perms reload`, session switch). */
+  let userRules: PermissionRule[] = []
+  let projectRules: PermissionRule[] = []
+  /** Rule-file diagnostics (a broken JSON file must be reported, not ignored). */
+  let rulesErrors: string[] = []
+  /** Read-only tools are auto-allowed unless the config/deployment says no. */
+  let autoAllowReadOnly = config.autoAllowReadOnly
+  /** Rule keys already reported on screen (one notice per rule per session). */
+  const announcedRules = new Set<string>()
+  /** Ctrl-E on the approval panel expands the pending call's arguments. */
+  let approvalExpanded = false
+
+  const ruleStack = (): PermissionRule[] => [
+    ...builtinRules(autoAllowReadOnly),
+    ...userRules,
+    ...projectRules,
+    ...sessionRules,
+  ]
+
+  const loadRules = (announce: boolean): void => {
+    const paths = rulesPaths(process.cwd())
+    const user = readRulesFile(paths.user, 'user')
+    const project = readRulesFile(paths.project, 'project')
+    userRules = [...user.rules]
+    projectRules = [...project.rules]
+    rulesErrors = [user, project]
+      .filter((file) => file.error !== undefined)
+      .map((file) => `${file.path}：${file.error ?? ''}`)
+    if (announce) {
+      channel.pushSystem(
+        `审批规则已重新读取：user ${userRules.length} 条 · project ${projectRules.length} 条 · session ${sessionRules.length} 条`,
+      )
+      for (const problem of rulesErrors) channel.pushSystem(`规则文件无法解析，已忽略：${problem}`)
+    }
+  }
+
+  /** Rule keys are stable across reloads — that is what the notice dedupes on. */
+  const ruleKey = (rule: PermissionRule): string => `${rule.scope}:${rule.decision}:${rule.pattern}`
+
+  const noteRuleHit = (rule: PermissionRule, toolName: string): void => {
+    const key = ruleKey(rule)
+    if (announcedRules.has(key)) return
+    announcedRules.add(key)
+    channel.pushSystem(`⛨ 规则命中：${ruleText(rule)}（${scopeLabel(rule.scope)}${rule.reason !== undefined ? ` · ${rule.reason}` : ''}）→ ${toolName}`)
+  }
+
+  const scopeLabel = (scope: RuleScope): string =>
+    scope === 'session' ? '本会话' : scope === 'project' ? '项目' : scope === 'user' ? '用户' : '内置'
+
+  /** Approve/deny state to report once a rule auto-answered an ask. */
 
   const showApprovalPanel = (): void => {
     const head = approvalQueue[0]
@@ -399,13 +472,82 @@ export function bootstrapApp(
     // the user to approve a bare tool name.
     const call = head.callId === undefined ? undefined : channel.toolPreviewFor(head.callId)
     const detail = call !== undefined ? ` · ${call}` : head.reason !== '' ? ` — ${head.reason}` : ''
-    picker = openPicker(
-      `审批：${head.toolName}${detail}`,
-      [
-        { value: 'allowed-once', label: '放行单次', hint: '1' },
-        { value: 'rejected', label: '拒绝', hint: '2/Esc' },
-      ],
+    // Rule capture is only offered when the rule would still be narrower than
+    // the tool itself: an unparsable/oversized call gets no "总是放行" row that
+    // silently means "this tool, always".
+    const narrow = suggestPattern(head.toolName, argsOf(head))
+    const items: PickerItem[] = []
+    // Rule origin goes INSIDE the panel, not into the transcript: it must be
+    // readable at the moment of the decision, and it explains why an `ask`
+    // rule beat an `allow` rule.
+    if (head.rule !== undefined) {
+      items.push({ value: '__rule__', label: `命中规则：${ruleText(head.rule)}（${scopeLabel(head.rule.scope)}）`, disabled: true })
+    }
+    items.push(
+      { value: 'allowed-once', label: '放行单次', hint: '1' },
+      { value: 'allow-session', label: `本会话放行 ${head.toolName}`, hint: '2' },
+      narrow !== head.toolName
+        ? { value: 'allow-project', label: `总是放行 ${narrow}`, hint: '3 · 写入项目规则' }
+        : { value: 'allow-project', label: `总是放行 ${head.toolName}（整工具）`, hint: '3 · 写入项目规则' },
+      { value: 'rejected', label: '拒绝', hint: '4/Esc' },
     )
+    picker = openPicker(`审批：${head.toolName}${detail}`, items)
+  }
+
+  /** Raw arguments of the ask under decision, when the channel still has them. */
+  const argsOf = (entry: PendingApproval): string | undefined =>
+    entry.callId === undefined ? undefined : channel.toolArgumentsFor(entry.callId)
+
+  /**
+   * Ctrl-E on the approval panel: dump the pending call's FULL arguments into
+   * the transcript. The panel title keeps a one-line preview (so the layout
+   * contract holds), and the expansion lands where the terminal's own
+   * selection and scrollback can reach it — a transcript row is copyable, a
+   * panel row is not.
+   */
+  const expandApproval = (): void => {
+    const head = approvalQueue[0]
+    if (!head) return
+    const raw = argsOf(head)
+    if (raw === undefined) {
+      channel.pushSystem(
+        `无法展开参数：${head.callId === undefined ? '内核未给 callId' : '参数超过 64 KiB 保留上限'}（按 ${head.toolName} 整工具判断）`,
+      )
+      return
+    }
+    if (approvalExpanded) {
+      channel.pushSystem('参数已展开过（再按 Ctrl-E 不会重复打印）')
+      return
+    }
+    approvalExpanded = true
+    let pretty = raw
+    try {
+      pretty = JSON.stringify(JSON.parse(raw), null, 2)
+    } catch {
+      // Non-JSON payload: print it as-is.
+    }
+    const lines = pretty.split('\n')
+    const MAX_LINES = 40
+    const body = lines.slice(0, MAX_LINES).join('\n')
+    channel.pushSystem(`审批参数（${head.toolName}）:\n${body}${lines.length > MAX_LINES ? `\n…还有 ${lines.length - MAX_LINES} 行` : ''}`)
+  }
+
+  /** Add a rule and persist it when it has a file scope. */
+  const addRule = (rule: PermissionRule): { readonly ok: boolean; readonly detail: string } => {
+    if (rule.scope === 'session') {
+      sessionRules = [...sessionRules, { ...rule, scope: 'session' }]
+      return { ok: true, detail: '本会话' }
+    }
+    const paths = rulesPaths(process.cwd())
+    const path = rule.scope === 'user' ? paths.user : paths.project
+    const existing = rule.scope === 'user' ? userRules : projectRules
+    const already = existing.findIndex((candidate) => candidate.pattern === rule.pattern && candidate.decision === rule.decision)
+    const next = already === -1 ? [...existing, rule] : existing
+    const written = writeRulesFile(path, next)
+    if (!written.ok) return { ok: false, detail: `${path}：${written.error}` }
+    if (rule.scope === 'user') userRules = next
+    else projectRules = next
+    return { ok: true, detail: path }
   }
 
   const settleApprovalHead = (outcome: 'allowed-once' | 'rejected' | 'cancelled'): void => {
@@ -416,9 +558,35 @@ export function bootstrapApp(
     }
     head.settled = true
     if (pickerStage?.kind === 'approval') closePicker()
+    approvalExpanded = false
     head.resolve(outcome)
     // Show the next queued ask, if any.
     if (approvalQueue.length > 0) showApprovalPanel()
+  }
+
+  /**
+   * One panel decision. Rule-capture rows ("本会话放行" / "总是放行") write the
+   * rule FIRST and then answer the ask exactly as a plain approval would, so
+   * the kernel-side outcome vocabulary never grows.
+   */
+  const decideApproval = (value: string): void => {
+    const head = approvalQueue[0]
+    if (!head) return
+    if (value === 'allow-session' || value === 'allow-project') {
+      const scope: RuleScope = value === 'allow-session' ? 'session' : 'project'
+      const pattern = scope === 'session' ? head.toolName : suggestPattern(head.toolName, argsOf(head))
+      const created = addRule({ decision: 'allow', scope, pattern })
+      if (!created.ok) {
+        channel.pushSystem(`规则写入失败：${created.detail}`)
+      } else {
+        channel.pushSystem(`已加规则：allow ${pattern}（${scopeLabel(scope)} · ${created.detail}）`)
+        // The user's action IS the record — do not re-announce this rule.
+        announcedRules.add(`${scope}:allow:${pattern}`)
+      }
+      settleApprovalHead('allowed-once')
+      return
+    }
+    settleApprovalHead(value === 'allowed-once' ? 'allowed-once' : 'rejected')
   }
 
   const answerApproval = (
@@ -431,14 +599,27 @@ export function bootstrapApp(
     // plan mode deliberately does NOT (kernel plan mode keeps every tool
     // callable and lets approvals/sandbox own enforcement).
     if (askMode) return Promise.resolve('rejected')
-    // Yolo: auto-allow without ever showing the panel.
+    // Yolo: auto-allow without ever showing the panel. It is a deliberate
+    // "stop asking" switch, so it short-circuits BEFORE rules — and the rules
+    // themselves can only answer an ask that reaches us.
     if (yoloMode) return Promise.resolve('allowed-once')
     if (disposed) return Promise.resolve('cancelled')
+    const name = toolName === '' ? 'tool' : toolName
+    const args = callId === undefined || callId === '' ? undefined : channel.toolArgumentsFor(callId)
+    // The rule layer decides the ANSWER; the kernel still owns the ask, the
+    // audit pair and the sandbox. `allow`/`deny` therefore resolve exactly the
+    // same vocabulary the panel would have produced, so the log stays honest.
+    const match = evaluateCall(ruleStack(), name, args)
+    if (match && match.decision !== 'ask') {
+      noteRuleHit(match.rule, name)
+      return Promise.resolve(match.decision === 'allow' ? 'allowed-once' : 'rejected')
+    }
     return new Promise<'allowed-once' | 'rejected' | 'cancelled'>((resolve) => {
       const entry: PendingApproval = {
-        toolName: toolName === '' ? 'tool' : toolName,
+        toolName: name,
         ...(callId === undefined || callId === '' ? {} : { callId }),
         reason,
+        ...(match === undefined ? {} : { rule: match.rule }),
         resolve,
         settled: false,
       }
@@ -626,6 +807,9 @@ export function bootstrapApp(
       case 'permission':
         void doPermission(args)
         break
+      case 'perms':
+        doPerms(args)
+        break
       case 'nerdfont':
         doNerdFont(args)
         break
@@ -771,6 +955,164 @@ export function bootstrapApp(
     }
     showPermission()
     await runKernelCommand('/permission')
+  }
+
+  /**
+   * Local permission rules (`/perms`). The kernel has NO rule engine — its
+   * `ctx.approval` is policy-level (`ask` | `never`) — so "don't ask me again"
+   * is Orca's own layer. It is deliberately inspectable: every rule prints with
+   * its scope and file, `/perms` shows the ORIGIN of anything already in
+   * force, and nothing here can run a tool the kernel refused.
+   *
+   *   /perms                             list effective rules + files
+   *   /perms allow|deny|ask <pattern>    add (project file by default)
+   *   /perms ... --user | --session      choose scope (`--reason <文字>` 可选)
+   *   /perms rm <n>                      remove the rule numbered by /perms
+   *   /perms reads on|off                builtin 只读工具免问（本次运行）
+   *   /perms reload                      re-read both rule files
+   */
+  const doPerms = (args: string): void => {
+    const parts = args.trim().split(/\s+/).filter((part) => part !== '')
+    const verb = (parts[0] ?? 'list').toLowerCase()
+    const paths = rulesPaths(process.cwd())
+
+    const describe = (rule: PermissionRule, index?: number): string => {
+      const number = index === undefined ? '' : `${String(index).padStart(2, ' ')}. `
+      const reason = rule.reason === undefined ? '' : ` — ${rule.reason}`
+      const mark = rule.decision === 'deny' ? '⛔' : rule.decision === 'ask' ? '❓' : '✓'
+      return `${number}${mark} ${ruleText(rule)} [${scopeLabel(rule.scope)}]${reason}`
+    }
+
+    const list = (): void => {
+      const builtin = builtinRules(autoAllowReadOnly)
+      const all = ruleStack()
+      channel.pushSystem(
+        `审批规则（共 ${all.length} 条）：内置 ${builtin.length} · 用户 ${userRules.length} · 项目 ${projectRules.length} · 本会话 ${sessionRules.length}`,
+      )
+      channel.pushSystem(`判定优先级：deny > ask > allow；同判定下更靠后的作用域胜出（本会话 > 项目 > 用户 > 内置）`)
+      all.forEach((rule, index) => {
+        channel.pushSystem(describe(rule, index + 1))
+      })
+      if (all.length === 0) {
+        channel.pushSystem('（没有规则：每次审批都会问；只读工具免问可用 /perms reads on 打开）')
+      }
+      channel.pushSystem(`用户规则：${paths.user}`)
+      channel.pushSystem(`项目规则：${paths.project}（“总是放行”写这里）`)
+      if (yoloMode) channel.pushSystem('注意：yolo 当前开着，规则不会被执行（yolo 先放行一切）')
+      for (const problem of rulesErrors) channel.pushSystem(`规则文件无法解析，已忽略：${problem}`)
+    }
+
+    if (verb === 'list') {
+      list()
+      return
+    }
+
+    if (verb === 'reload') {
+      loadRules(true)
+      return
+    }
+
+    if (verb === 'reads') {
+      const choice = (parts[1] ?? '').toLowerCase()
+      if (choice !== 'on' && choice !== 'off') {
+        channel.pushSystem(`只读工具免问：${autoAllowReadOnly ? '开' : '关'}（/perms reads on|off；持久开关是 profile 里 orca 行的 autoAllowReadOnly）`)
+        return
+      }
+      autoAllowReadOnly = choice === 'on'
+      channel.pushSystem(
+        autoAllowReadOnly
+          ? `只读工具免问已开启（本次运行）：${builtinRules(true).length} 条内置 allow（deny/ask 规则仍优先）`
+          : '只读工具免问已关闭（本次运行）：只读工具也会逐次确认',
+      )
+      return
+    }
+
+    if (verb === 'rm' || verb === 'remove') {
+      const index = Number.parseInt(parts[1] ?? '', 10)
+      const all = ruleStack()
+      if (!Number.isInteger(index) || index < 1 || index > all.length) {
+        channel.pushSystem(`用法：/perms rm <编号>（编号见 /perms 列表，1..${all.length}）`)
+        return
+      }
+      const target = all[index - 1]
+      if (!target) return
+      if (target.scope === 'builtin') {
+        channel.pushSystem('内置规则不可单条删除：用 /perms reads off 关闭只读免问')
+        return
+      }
+      if (target.scope === 'session') {
+        sessionRules = sessionRules.filter((rule) => rule !== target)
+        channel.pushSystem(`已删除本会话规则：${ruleText(target)}`)
+        return
+      }
+      const path = target.scope === 'user' ? paths.user : paths.project
+      const from = target.scope === 'user' ? userRules : projectRules
+      const next = from.filter((rule) => rule !== target)
+      const written = writeRulesFile(path, next)
+      if (!written.ok) {
+        channel.pushSystem(`规则文件写入失败：${written.error}`)
+        return
+      }
+      if (target.scope === 'user') userRules = next
+      else projectRules = next
+      channel.pushSystem(`已删除${scopeLabel(target.scope)}规则：${ruleText(target)}（${path}）`)
+      return
+    }
+
+    if (verb === 'allow' || verb === 'deny' || verb === 'ask') {
+      const decision = verb as RuleDecision
+      const flags = parts.slice(1)
+      let scope: RuleScope = 'project'
+      let reason: string | undefined
+      const patternParts: string[] = []
+      for (let index = 0; index < flags.length; index++) {
+        const token = flags[index] ?? ''
+        if (token === '--user' || token === '-u') scope = 'user'
+        else if (token === '--session' || token === '-s') scope = 'session'
+        else if (token === '--project' || token === '-p') scope = 'project'
+        else if (token === '--reason' || token === '-r') {
+          reason = flags[index + 1]
+          index++
+        } else patternParts.push(token)
+      }
+      let pattern = patternParts.join(' ')
+      if (pattern !== '' && parseRulePattern(pattern) === undefined && patternParts.length > 1) {
+        // A pattern containing spaces must be quoted; a bare multi-word entry
+        // is far more likely to be a forgotten quote than a valid pattern.
+        channel.pushSystem(`模式无法解析：${pattern}（含空格时请加引号，例如 bash("npm test":*)）`)
+        return
+      }
+      if (pattern === '') {
+        channel.pushSystem(`用法：/perms ${decision} <对象> [--user|--session] [--reason 文字]`)
+        channel.pushSystem('对象写法：* / tool / tool(参数) / tool(前缀:*) / tool(glob*)。例：/perms allow bash(npm test:*)')
+        return
+      }
+      if (decision === 'allow' && pattern === '*') {
+        channel.pushSystem('拒绝创建 allow *：整机放行请用 /yolo on（它明确、可一键关，也不会写进规则文件）')
+        return
+      }
+      const parsed = parseRulePattern(pattern)
+      if (parsed === undefined) {
+        channel.pushSystem(`模式无法解析：${pattern}（合法写法：* / tool / tool(参数) / tool(前缀:*)）`)
+        return
+      }
+      pattern = parsed.spec === undefined ? parsed.tool : `${parsed.tool}(${parsed.spec})`
+      const created = addRule({
+        decision,
+        scope,
+        pattern,
+        ...(reason === undefined ? {} : { reason }),
+      })
+      if (!created.ok) {
+        channel.pushSystem(`规则写入失败：${created.detail}`)
+        return
+      }
+      channel.pushSystem(`已加规则：${decision} ${pattern}（${scopeLabel(scope)} · ${created.detail}）`)
+      if (decision === 'deny') channel.pushSystem('deny 会直接拒绝该工具的调用（模型会收到拒绝结果），且优先于任何 allow')
+      return
+    }
+
+    channel.pushSystem('用法：/perms [list|allow|deny|ask|rm|reads|reload]（无参 = 列表）')
   }
 
   const doYolo = (args: string): void => {
@@ -1232,6 +1574,12 @@ export function bootstrapApp(
     flushedLine = 0
     titleCache = null
     livePreset = null
+    // Session-scoped approval rules and their "already announced" memo die with
+    // the session — file rules (user/project) are re-read on the next attach.
+    sessionRules = []
+    announcedRules.clear()
+    approvalExpanded = false
+    loadRules(false)
   }
 
   const switchToNew = (): Promise<void> => runSessionTask(async (signal) => {
@@ -1691,6 +2039,7 @@ export function bootstrapApp(
     refreshKernelCommands()
     refreshCustomCommands(true)
     refreshSkills()
+    loadRules(false)
   }
 
   // ── /model picker ─────────────────────────────────────────────────────────
@@ -2127,7 +2476,7 @@ export function bootstrapApp(
     if (pickerStage.kind === 'approval') {
       const item = pickedItem(picker)
       if (!item || item.disabled) return
-      settleApprovalHead(item.value === 'allowed-once' ? 'allowed-once' : 'rejected')
+      decideApproval(item.value)
       return
     }
     if (pickerStage.kind === 'presets') {
@@ -2210,15 +2559,26 @@ export function bootstrapApp(
 
   const handlePickerKey = (key: KeyPress): void => {
     if (!picker) return
-    // Approval shortcuts (kimi 1/2/3): answer without moving the cursor.
-    if (pickerStage?.kind === 'approval' && classify(key) === 'text') {
-      if (key.sequence === '1') {
-        settleApprovalHead('allowed-once')
+    // Approval shortcuts: numbered direct-select (kimi 1/2/3) answers without
+    // moving the cursor, so the common case is one keystroke. The numbers map
+    // to the ROWS THE USER SEES (1 = first selectable row), and Ctrl-E dumps
+    // the pending call's full arguments into the transcript — a one-line
+    // preview is not enough to approve a file write.
+    if (pickerStage?.kind === 'approval') {
+      if (key.ctrl && key.name === 'e') {
+        expandApproval()
         return
       }
-      if (key.sequence === '2') {
-        settleApprovalHead('rejected')
-        return
+      if (classify(key) === 'text') {
+        const index = Number.parseInt(key.sequence, 10)
+        if (Number.isInteger(index) && index >= 1 && index <= 9) {
+          const selectable = picker.items.filter((item) => item.disabled !== true)
+          const item = selectable[index - 1]
+          // An out-of-range digit must NOT silently fall through to the panel's
+          // own navigation (it would move the cursor on a stray keypress).
+          if (item) decideApproval(item.value)
+          return
+        }
       }
     }
     const action = classify(key)
